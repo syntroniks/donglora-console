@@ -57,16 +57,46 @@ Every layer keeps what failed, with its raw bytes in hex and a specific reason:
   isn't a failure). Failures name the stage (header, path, payload, advert, signature, channel, decrypt, MAC), the reason
   and the byte offset, and keep every field that did parse. The detail pane highlights the failing byte in the hex dump.
 
+Firmware 1.5.2 limits what the radio layer can show. Its RX path always sends `crc_valid = 1` and
+`freq_err = 0`, and drops packets whose CRC fails before they reach the host (`firmware/src/radio.rs`). So *CRC fail*
+only appears with other firmware or the demo radio, and the frequency error column reads 0 on real hardware.
+
 The Packets filter (All / Decoded / Failed / No key / CRC fail) defaults to All. Overview counts each category, and in
 the shell `/rx on` prints failures in red with their reasons. The demo radio produces every kind of failure at every
 layer, so all of them can be seen without hardware.
+
+## Noise floor
+
+DongLoRa v1.0 has no instantaneous-RSSI command, so the noise floor is estimated from packets. Each packet's RSSI
+averages signal and noise, and firmware 1.5.2 rounds RSSI and SNR to whole dB, so the noise under a packet is
+`RSSI − 10·log10(1 + 10^(SNR/10))`. That holds at negative SNR too, and is good to about ±1 dB. Packets with a failed
+CRC are left out. `src/radio/noiseFloor.ts` (no DOM) keeps two figures:
+
+- MeshCore's floor (`RadioLibWrappers.cpp` `loop()`): starts unset, takes only samples below floor + 14 dB, sets the
+  floor to the integer average of 64 of them, clamped at −120 dBm, then starts the next batch. With packet
+  estimates this needs 64 packets.
+- A rolling median of the last 15 estimates, which is useful much sooner.
+
+Samples carry a source, `packet-estimate` or `measured`. If a future firmware command reports measured RSSI between
+packets, those samples take over while they keep arriving, and the badge on the Overview card changes. Overview shows
+both figures with a chart of packet RSSI and noise. The Packets table has a per-packet noise column, and `/noise`
+prints the same in the shell.
+
+## Receiver front end
+
+The Radio tab and `/agc` list RX gain mode, AGC reset, FEM/LNA, TCXO and DC-DC. No firmware reports these yet, so the
+values come from a table keyed by firmware version and board (`src/radio/frontEnd.ts`), each badged *firmware default
+(not reported by device)*. For 1.5.2 on the Heltec V4: SX1262 RX gain in power-saving mode (0x94; boosted 0x96 would
+add about 3 dB for about 2 mA), no AGC reset (MeshCore warm-sleeps the radio periodically), the front-end module and its
+LNA not driven, TCXO 1.8 V, DC-DC on. Other versions show *unknown*. Device-reported values from a future diagnostics
+command can be merged with `deviceReported()`.
 
 ## Shell
 
 Commands are local; DongLoRa has no CLI. `/help`, `/info` (GET_INFO), `/ping`, `/config` (requested and echoed),
 `/preset us|eu|au|nz`, `/rx on|off` (print packets), `/rx start|stop` (RX_START / RX_STOP), `/frames on|all|off` (hex of
-every frame, `all` includes keepalive PINGs), `/stats`, `/errors`, `/nodes`, `/clear` and `/tx <hex>` (needs TX armed,
-asks to confirm). Tab completes, arrows walk history, Ctrl-C stops waiting for a command.
+every frame, `all` includes keepalive PINGs), `/stats`, `/noise`, `/agc`, `/errors`, `/nodes`, `/clear` and `/tx <hex>`
+(needs TX armed, asks to confirm). Tab completes, arrows walk history, Ctrl-C stops waiting for a command.
 
 ## Session handling
 
@@ -77,8 +107,10 @@ client probe with an RX command. That is a no-op on a live session, and on a res
 On ENOTCONFIGURED the client re-sends the last config and restarts RX if it was on. A TX is never retried. Overview
 shows PING round trips, the longest write gap and sessions lost and restored.
 
-The connection lives outside React (`src/ui/store.ts`), so StrictMode and Fast Refresh can't open a second port. On a
-hot update of the store the open client is handed to the new module. The WebSerial transport serialises writes,
+The connection lives outside React (`src/ui/store.ts`), so StrictMode and Fast Refresh can't open a second port. There
+is one store per page, kept on `globalThis`. When Vite re-runs the module, the live instance keeps its client, port and
+subscribers and takes the new code; Vite doesn't call `dispose` on intermediate modules, so a handover would get lost.
+A crash in one view is caught by an error boundary instead of unmounting the app. The WebSerial transport serialises writes,
 catches recoverable read errors inside its loop, waits for the read loop before closing the port, raises DTR explicitly
 (the firmware's host-present signal), and closes the port when the stream dies so Connect works again.
 
@@ -94,6 +126,7 @@ src/protocol/        DongLoRa Protocol, no UI dependencies
   ticker.ts          Worker-backed interval for the keepalive
   transports/        WebSerial, and the simulated dongle for demo mode and tests
 src/meshcore/        MeshCore over-the-air packets: decode (with failure stages), crypto, builders, presets
+src/radio/           noise floor estimation, receiver front-end table
 src/console/         shell line editing and command catalog
 src/ui/              React views, the connection store, the xterm shell
 scripts/             Node tools (node-serialport transport, probe)

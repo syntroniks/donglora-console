@@ -5,7 +5,8 @@
 
 import { DongLoRaClient, type KeepaliveHealth, type LinkError, type LinkErrorKind, type Transport } from '../protocol/client.ts'
 import type { Frame } from '../protocol/framing.ts'
-import type { DeviceInfo, LoRaConfig, RxPacket, SetConfigReply, TxDone } from '../protocol/messages.ts'
+import { Capability } from '../protocol/codes.ts'
+import { hasCapability, type DeviceInfo, type LoRaConfig, type RadioStatus, type RxPacket, type SetConfigReply, type TxDone } from '../protocol/messages.ts'
 import { MockDongLoRaTransport } from '../protocol/transports/mock.ts'
 import { WebSerialTransport } from '../protocol/transports/webserial.ts'
 import { validateConfig } from '../protocol/lora.ts'
@@ -31,6 +32,14 @@ export interface NoisePoint {
   rssi: number
   crcValid: boolean
   noise?: number
+  floor?: number
+  median?: number
+}
+
+/** one point per RADIO_STATUS reply with an RSSI, for the noise chart */
+export interface MeasuredPoint {
+  at: number
+  dbm: number
   floor?: number
   median?: number
 }
@@ -115,7 +124,18 @@ export interface RadioState {
   txArmed: boolean
   noise: NoiseFloorState
   noiseHistory: NoisePoint[]
+  measuredHistory: MeasuredPoint[]
+  /** the last RADIO_STATUS reply of this connection (firmware 1.6.0, protocol v1.1) */
+  radioStatus?: RadioStatus
+  radioStatusAt?: number
+  /** device counters when this connection's first RADIO_STATUS arrived (or stats were reset), for deltas */
+  countersBase?: RadioStatus
+  /** GET_INFO advertised RADIO_STATUS but the device answered EUNKNOWN_CMD */
+  radioStatusRefused: boolean
 }
+
+/** GET_INFO advertises RADIO_STATUS (capability bit 33) and the device hasn't refused it. */
+export const radioStatusAvailable = (s: RadioState): boolean => !!s.info && hasCapability(s.info, Capability.RadioStatus) && !s.radioStatusRefused
 
 export interface StoreEvents {
   packet: (p: PacketEntry) => void
@@ -131,6 +151,8 @@ const LINK_ERRORS_MAX = 500
 const POSTS_MAX = 500
 const LOG_MAX = 200
 const NOISE_HISTORY_MAX = 600
+/** about 10 minutes of keepalive samples */
+const MEASURED_HISTORY_MAX = 1200
 
 const emptyStats = (): Stats => ({
   rx: 0,
@@ -159,6 +181,8 @@ const initialState = (requested: LoRaConfig = DEFAULT_PRESET.config): RadioState
   txArmed: false,
   noise: new NoiseFloorTracker().snapshot(),
   noiseHistory: [],
+  measuredHistory: [],
+  radioStatusRefused: false,
 })
 
 const initialListeners = (): { [K in keyof StoreEvents]: Set<StoreEvents[K]> } => ({
@@ -239,7 +263,7 @@ export class RadioStore {
 
   private async connect(transport: Promise<Transport>, demo: boolean): Promise<void> {
     if (this.client) return
-    this.patch({ status: 'connecting', error: undefined, demo })
+    this.patch({ status: 'connecting', error: undefined, demo, radioStatus: undefined, radioStatusAt: undefined, countersBase: undefined, radioStatusRefused: false })
     let c: DongLoRaClient | null = null
     try {
       c = new DongLoRaClient(await transport)
@@ -274,6 +298,11 @@ export class RadioStore {
       c.on('frameOut', (f) => this.emit('frameOut', f)),
       c.on('config', (applied) => this.patch({ applied })),
       c.on('keepalive', (h) => this.patch({ health: { ...h } })),
+      c.on('radioStatus', (status) => this.onRadioStatus(status)),
+      c.on('radioStatusUnsupported', (reason) => {
+        this.log(reason, 'warn')
+        this.patch({ radioStatusRefused: true })
+      }),
       c.on('sessionLost', (reason) => this.log(`session lost: ${reason}`, 'warn')),
       c.on('recovered', () => {
         this.log('session restored: config re-sent' + (c.rxWanted ? ', RX restarted' : ''))
@@ -454,6 +483,25 @@ export class RadioStore {
     this.emit('packet', entry)
   }
 
+  /** Every keepalive on firmware 1.6.0: a measured noise sample (when receiving), front end and counters. */
+  private onRadioStatus(status: RadioStatus): void {
+    const at = Date.now()
+    if (status.rssiInst !== null) this.noise.add({ at, dbm: status.rssiInst, source: 'measured' })
+    // taken on every reply, so the source falls back to packet estimates once RSSI stops coming
+    const noise = this.noise.snapshot(at)
+    this.patch((s) => {
+      const b = s.countersBase
+      // a new connection, or the dongle rebooted and its counters started again
+      const rebase = !b || status.rxOk < b.rxOk || status.rxCrcErr < b.rxCrcErr || status.rxHeaderErr < b.rxHeaderErr
+      const next: Partial<RadioState> = { radioStatus: status, radioStatusAt: at, countersBase: rebase ? status : b, noise }
+      if (status.rssiInst !== null) {
+        const point: MeasuredPoint = { at, dbm: status.rssiInst, floor: noise.floor, median: noise.median }
+        next.measuredHistory = [...s.measuredHistory, point].slice(-MEASURED_HISTORY_MAX)
+      }
+      return next
+    })
+  }
+
   private onLinkError(e: LinkError): void {
     const entry: LinkEntry = { ...e, id: this.nextId++ }
     this.patch((s) => ({
@@ -473,7 +521,7 @@ export class RadioStore {
 
   resetStats(): void {
     this.noise = new NoiseFloorTracker()
-    this.patch({ stats: emptyStats(), noise: this.noise.snapshot(), noiseHistory: [] })
+    this.patch((s) => ({ stats: emptyStats(), noise: this.noise.snapshot(), noiseHistory: [], measuredHistory: [], countersBase: s.radioStatus }))
   }
 
   clearError(): void {

@@ -1,13 +1,14 @@
-import { useState } from 'react'
+import { useState, type ReactNode } from 'react'
 import { fromHex } from '../protocol/bytes.ts'
-import { LORA_BANDWIDTHS_KHZ, LORA_CODING_RATES, TX_RESULT_NAMES } from '../protocol/codes.ts'
+import { FEM_TYPE_NAMES, FemFlag, FemType, LORA_BANDWIDTHS_KHZ, LORA_CODING_RATES, TX_RESULT_NAMES } from '../protocol/codes.ts'
 import { describeConfig, mhz, supportedBws, supportedSfs, syncWordHex, validateConfig } from '../protocol/lora.ts'
 import type { LoRaConfig } from '../protocol/messages.ts'
 import { matchPreset, PRESETS } from '../meshcore/presets.ts'
-import { FRONT_END_ROWS, FRONT_END_SOURCE_LABELS, frontEndFor } from '../radio/frontEnd.ts'
+import { FRONT_END_ROWS, FRONT_END_SOURCE_LABELS, frontEndFor, TX_POWER_MEANING_LABELS, txPowerMeaning } from '../radio/frontEnd.ts'
 import { configRows } from './configRows.ts'
 import { Button, Card, Empty, Rows } from './parts.tsx'
-import { store, type RadioState } from './store.ts'
+import { ago } from './format.ts'
+import { radioStatusAvailable, store, type RadioState } from './store.ts'
 
 interface Form {
   freqMHz: string
@@ -48,12 +49,51 @@ const fromForm = (f: Form): LoRaConfig => ({
   iqInvert: f.iqInvert,
 })
 
-export function FemCaveat() {
+/** What the TX power value means here: antenna output through 1.6.0's gain curve, or the bare SX1262 setting. */
+export function FemCaveat({ state }: { state: RadioState }) {
+  const { info, radioStatus: rs } = state
+  const meaning = txPowerMeaning(info, rs)
+  const fw = info ? `DongLoRa ${info.firmware.major}.${info.firmware.minor}.${info.firmware.patch}` : ''
+  const range = info ? ` (GET_INFO: ${info.txPowerMinDbm}…${info.txPowerMaxDbm} dBm)` : ''
+  const fem = rs ? FEM_TYPE_NAMES[rs.femType] ?? 'front-end module' : ''
+  let text: ReactNode
+  if (meaning === 'antenna') {
+    text = (
+      <>
+        the {fem} is powered and {fw} maps the dBm value to SX1262 drive through a measured gain curve, so it is approximate
+        antenna output{range}.{rs!.femFlags & FemFlag.Pa ? '' : ' RADIO_STATUS reports the PA in bypass right now.'}
+      </>
+    )
+  } else if (meaning === 'chip' && rs) {
+    text = rs.femType === FemType.None
+      ? <>{fw} reports no front-end module, so the dBm value is the SX1262’s own output.</>
+      : <>RADIO_STATUS reports the {fem} unpowered, so the dBm value is the bare SX1262 setting into an unpowered module.</>
+  } else if (meaning === 'chip') {
+    text = (
+      <>
+        the board has an external front-end module (GC1109 or KCT8103L PA/LNA). {fw} never drives its control pins (GPIO7 LDO,
+        GPIO2 CSD, GPIO46 CPS / GPIO5 CTX), unlike MeshCore. The dBm value is the SX1262’s own setting into an unpowered module, not
+        antenna output, and receive sensitivity may be lower than under MeshCore firmware.
+      </>
+    )
+  } else if (info) {
+    text = (
+      <>
+        {fw} powers the front-end module and maps the dBm value to SX1262 drive through a measured gain curve, so with a FEM it is
+        approximate antenna output{range}. RADIO_STATUS hasn’t confirmed this board’s module yet.
+      </>
+    )
+  } else {
+    text = (
+      <>
+        the board has an external front-end module (GC1109 or KCT8103L PA/LNA). On DongLoRa 1.6.0 it is powered and the dBm value is
+        approximate antenna output through a measured gain curve; on 1.5.2 it is the bare SX1262 setting into an unpowered module.
+      </>
+    )
+  }
   return (
     <p className="caveat">
-      <strong>Heltec V4:</strong> the board has an external front-end module (GC1109 or KCT8103L PA/LNA). DongLoRa 1.5.2
-      never drives its control pins (GPIO7 LDO, GPIO2 CSD, GPIO46 CPS / GPIO5 CTX), unlike MeshCore. The dBm value is the
-      SX1262’s own setting, not antenna output, and receive sensitivity may be lower than under MeshCore firmware.
+      <strong>Heltec V4:</strong> {text}
     </p>
   )
 }
@@ -154,7 +194,7 @@ export function RadioView({ state }: { state: RadioState }) {
           explicit header, CRC on, normal IQ. TX power only matters when transmitting, but SET_CONFIG needs a value.
           {!info && ' Connect to check against what this radio supports.'}
         </p>
-        <FemCaveat />
+        <FemCaveat state={state} />
         {problems.length > 0 && <ul className="problems">{problems.map((p) => <li key={p}>{p}</li>)}</ul>}
         {error && <p className="editor-error">{error}</p>}
       </Card>
@@ -190,7 +230,11 @@ export function RadioView({ state }: { state: RadioState }) {
 }
 
 function FrontEndCard({ state }: { state: RadioState }) {
-  const fe = frontEndFor(state.info)
+  const fe = frontEndFor(state.info, state.radioStatus)
+  const available = radioStatusAvailable(state)
+  let source = 'No RADIO_STATUS on this firmware, so the values come from reading its source. Hover a value for where.'
+  if (state.radioStatus) source = `RX gain and the FEM rows are device-reported by RADIO_STATUS (updated ${ago(state.radioStatusAt)}); AGC reset, TCXO and DC-DC come from reading the firmware source. Hover a value for where.`
+  else if (available) source = 'RX gain and the FEM rows fill in from the first RADIO_STATUS reply; the rest come from reading the firmware source. Hover a value for where.'
   return (
     <Card title="Receiver front end">
       <Rows
@@ -207,7 +251,7 @@ function FrontEndCard({ state }: { state: RadioState }) {
       />
       <p className="note">
         {state.info ? `Firmware ${fe.firmware}, board ${fe.board}${fe.boardAssumed ? ' (assumed: GET_INFO doesn’t name the board)' : ''}. ` : 'Connect to look up this firmware. '}
-        No DongLoRa firmware reports these yet; the values come from reading its source. Hover a value for where.
+        {source}
       </p>
     </Card>
   )
@@ -219,6 +263,7 @@ function TxCard({ state }: { state: RadioState }) {
   const [error, setError] = useState<string>()
   const connected = state.status === 'connected'
   const c = state.applied?.lora
+  const power = TX_POWER_MEANING_LABELS[txPowerMeaning(state.info, state.radioStatus)]
   let bytes: Uint8Array | null = null
   try {
     bytes = hex.trim() ? fromHex(hex) : null
@@ -238,7 +283,7 @@ function TxCard({ state }: { state: RadioState }) {
   const send = async () => {
     if (!bytes || !c) return
     const ok = window.confirm(
-      `Transmit ${bytes.length} bytes on ${mhz(c.freqHz)} MHz, SF${c.sf}, at ${c.txPowerDbm} dBm (SX1262 setting)?\n\n` +
+      `Transmit ${bytes.length} bytes on ${mhz(c.freqHz)} MHz, SF${c.sf}, at ${c.txPowerDbm} dBm (${power})?\n\n` +
         'The firmware enforces no regulatory limits. You are responsible for being allowed to transmit on this frequency.',
     )
     if (!ok) return
@@ -258,10 +303,10 @@ function TxCard({ state }: { state: RadioState }) {
       <label className={`arm ${state.txArmed ? 'arm-on' : ''}`}>
         <input type="checkbox" checked={state.txArmed} disabled={!connected} onChange={(e) => arm(e.target.checked)} />
         <span>
-          Enable TX{c ? ` on ${mhz(c.freqHz)} MHz at ${c.txPowerDbm} dBm (chip setting)` : ''}
+          Enable TX{c ? ` on ${mhz(c.freqHz)} MHz at ${c.txPowerDbm} dBm (${power})` : ''}
         </span>
       </label>
-      <FemCaveat />
+      <FemCaveat state={state} />
       <p className="muted small">Off by default and on every new connection. Each send asks again.</p>
       <div className="editor-line">
         <input className="hex-input" placeholder="packet bytes in hex" value={hex} onChange={(e) => setHex(e.target.value)} disabled={!state.txArmed} />

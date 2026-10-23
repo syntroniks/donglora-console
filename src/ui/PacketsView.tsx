@@ -78,7 +78,7 @@ export function Packets({ packets, onClear }: { packets: PacketEntry[]; onClear:
           <div className="table-wrap">
             <table className="table packets">
               <thead>
-                <tr><th>Time</th><th>RSSI</th><th>SNR</th><th title="Noise under the packet: RSSI − 10·log10(1 + 10^(SNR/10)), whole dBm">Noise</th><th>Freq err</th><th>CRC</th><th>Len</th><th>Status</th><th>MeshCore</th></tr>
+                <tr><th>Time</th><th>RSSI</th><th>SNR</th><th title="Noise under the packet: RSSI − 10·log10(1 + 10^(SNR/10)), whole dBm">Noise</th><th title="Frequency error the SX126x estimated for the packet (always 0 on firmware 1.5.2)">Freq err (Hz)</th><th>CRC</th><th>Len</th><th>Status</th><th>MeshCore</th></tr>
               </thead>
               <tbody>
                 {rows.map((p) => (
@@ -87,7 +87,7 @@ export function Packets({ packets, onClear }: { packets: PacketEntry[]; onClear:
                     <td>{level(p.rx.rssi)}</td>
                     <td>{level(p.rx.snr)}</td>
                     <td className="muted">{p.noise !== undefined ? Math.round(p.noise) : '—'}</td>
-                    <td className="muted">{p.rx.freqErr}</td>
+                    <td className="muted">{p.rx.freqErr > 0 ? '+' : ''}{p.rx.freqErr}</td>
                     <td>{p.rx.crcValid ? <span className="ok">ok</span> : <span className="err">FAIL</span>}</td>
                     <td>{p.rx.data.length}</td>
                     <td><StatusBadges p={p} /></td>

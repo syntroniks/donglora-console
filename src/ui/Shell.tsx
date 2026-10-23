@@ -10,9 +10,9 @@ import { LINK_ERROR_NAMES } from '../protocol/client.ts'
 import type { Frame } from '../protocol/framing.ts'
 import { bwKHz, describeConfig, mhz, supportedBws, supportedSfs, syncWordHex } from '../protocol/lora.ts'
 import { presetById, PRESETS } from '../meshcore/presets.ts'
-import { FRONT_END_ROWS, FRONT_END_SOURCE_LABELS, frontEndFor } from '../radio/frontEnd.ts'
+import { FRONT_END_ROWS, FRONT_END_SOURCE_LABELS, frontEndFor, TX_POWER_MEANING_LABELS, txPowerMeaning } from '../radio/frontEnd.ts'
 import { MEDIAN_WINDOW, NOISE_SOURCE_LABELS, NUM_NOISE_FLOOR_SAMPLES } from '../radio/noiseFloor.ts'
-import { store, type PacketEntry } from './store.ts'
+import { radioStatusAvailable, store, type PacketEntry } from './store.ts'
 import { ago, level, plural, time } from './format.ts'
 
 const C = {
@@ -59,7 +59,7 @@ export function Shell() {
 
     const flags = { rx: false, frames: 'off' as 'off' | 'on' | 'all', confirmTx: '', confirmAt: 0 }
     let running: { cancelled: boolean } | null = null
-    const pingTags = new Set<number>()
+    const keepaliveTags = new Set<number>()
 
     const editor = new LineEditor({
       prompt: store.getState().status === 'connected' ? PROMPT_ON : PROMPT_IDLE,
@@ -165,8 +165,13 @@ export function Shell() {
           const link = Object.entries(st.link).map(([k, v]) => `${LINK_ERROR_NAMES[k as keyof typeof LINK_ERROR_NAMES]} ${v}`).join(', ')
           say(`link errors ${st.linkTotal}${link ? `: ${link}` : ''}`)
           if (st.good) say(`RSSI avg ${(st.rssiSum / st.good).toFixed(1)} dBm (${st.rssiMin}…${st.rssiMax}), SNR avg ${(st.snrSum / st.good).toFixed(1)} dB (${st.snrMin}…${st.snrMax})`)
+          const r = s.radioStatus
+          if (r) {
+            const b = s.countersBase ?? r
+            say(`radio counters since boot ${C.dim('(RADIO_STATUS, +since connect)')}: ${r.rxOk} good CRC (+${r.rxOk - b.rxOk}), ${r.rxCrcErr ? C.err(`${r.rxCrcErr} CRC error`) : '0 CRC error'} (+${r.rxCrcErr - b.rxCrcErr}), ${r.rxHeaderErr ? C.err(`${r.rxHeaderErr} header error`) : '0 header error'} (+${r.rxHeaderErr - b.rxHeaderErr}, no bytes)`)
+          }
           const h = s.health
-          if (h) say(`keepalive ${h.pings} PINGs, ${h.failures} failed, rtt ${h.lastRttMs?.toFixed(1) ?? '-'} ms, longest gap ${h.maxGapMs} ms, sessions lost ${h.lostSessions} (${h.recoveries} restored)`)
+          if (h) say(`keepalive ${h.pings} ${h.command ?? 'PING'} ok, ${h.failures} failed, rtt ${h.lastRttMs?.toFixed(1) ?? '-'} ms, longest gap ${h.maxGapMs} ms, sessions lost ${h.lostSessions} (${h.recoveries} restored)`)
           return
         }
         case 'noise': {
@@ -174,13 +179,17 @@ export function Shell() {
           say(`noise floor ${C.dim(`(${NOISE_SOURCE_LABELS[n.source]})`)}`)
           say(`  MeshCore method  ${n.floor !== undefined ? `${n.floor} dBm, set ${ago(n.floorAt)}` : C.dim(`pending, ${n.pending}/${NUM_NOISE_FLOOR_SAMPLES} samples`)}`)
           say(`  median last ${MEDIAN_WINDOW}   ${n.median !== undefined ? `${n.median} dBm over ${n.medianCount}` : C.dim('no samples')}`)
-          say(`  last sample      ${n.last ? `${Math.round(n.last.dbm)} dBm, ${ago(n.last.at)}` : C.dim('none')}  (${n.accepted} used, ${n.rejected} over floor + 14 dB)`)
+          say(`  last sample      ${n.last ? `${n.source === 'measured' ? level(n.last.dbm) : Math.round(n.last.dbm)} dBm, ${ago(n.last.at)}` : C.dim('none')}  (${n.accepted} used, ${n.rejected} over floor + 14 dB)`)
+          if (radioStatusAvailable(s)) {
+            const r = s.radioStatus
+            say(`  RSSI now         ${!r ? C.dim('no RADIO_STATUS reply yet') : r.rssiInst !== null ? `${level(r.rssiInst)} dBm ${C.dim('(RADIO_STATUS)')}` : C.dim('none: the radio is not in continuous RX')}`)
+          } else if (s.info) say(C.dim('  this firmware has no RADIO_STATUS, so the floor is estimated from packets'))
           const recent = s.packets.filter((p) => p.noise !== undefined).slice(0, 8)
           if (recent.length) say(`  recent packets   ${recent.map((p) => `${level(p.rx.rssi)}/${level(p.rx.snr)}→${Math.round(p.noise!)}`).join('  ')} ${C.dim('(RSSI/SNR→noise)')}`)
           return
         }
         case 'agc': {
-          const fe = frontEndFor(s.info)
+          const fe = frontEndFor(s.info, s.radioStatus)
           say(`receiver front end, firmware ${fe.firmware}, board ${fe.board}${fe.boardAssumed ? C.dim(' (assumed)') : ''}`)
           for (const { key, label } of FRONT_END_ROWS) say(`  ${label.padEnd(14)} ${fe[key].value} ${C.dim(`[${FRONT_END_SOURCE_LABELS[fe[key].source]}]`)}`)
           return
@@ -211,7 +220,7 @@ export function Shell() {
           if (flags.confirmTx !== line || Date.now() - flags.confirmAt > 30000) {
             flags.confirmTx = line
             flags.confirmAt = Date.now()
-            return say(C.warn(`This transmits ${bytes.length} B on ${mhz(c.freqHz)} MHz at ${c.txPowerDbm} dBm (SX1262 setting). Enter the same command again within 30 s to send.`))
+            return say(C.warn(`This transmits ${bytes.length} B on ${mhz(c.freqHz)} MHz at ${c.txPowerDbm} dBm (${TX_POWER_MEANING_LABELS[txPowerMeaning(s.info, s.radioStatus)]}). Enter the same command again within 30 s to send.`))
           }
           flags.confirmTx = ''
           const done = await store.transmit(bytes)
@@ -237,11 +246,14 @@ export function Shell() {
       store.on('linkError', (e) => out(C.err(`[link] ${LINK_ERROR_NAMES[e.kind]}: ${e.reason}`) + C.dim(`  ${toHex(e.bytes.subarray(0, 24), ' ')}${e.bytes.length > 24 ? ' …' : ''}`))),
       store.on('log', (e) => out(e.level === 'info' ? C.dim(`[session] ${e.text}`) : e.level === 'warn' ? C.warn(`[session] ${e.text}`) : C.err(`[session] ${e.text}`))),
       store.on('frameOut', (f) => {
-        if (f.type === MsgType.Ping) pingTags.add(f.tag)
-        if (flags.frames === 'all' || (flags.frames === 'on' && f.type !== MsgType.Ping)) out(C.dim(`-> ${frameText(f)}`))
+        // RADIO_STATUS is the keepalive on firmware that has it; a manual /ping is filtered with them
+        const keepalive = f.type === MsgType.Ping || f.type === MsgType.RadioStatus
+        if (keepalive) keepaliveTags.add(f.tag)
+        if (flags.frames === 'all' || (flags.frames === 'on' && !keepalive)) out(C.dim(`-> ${frameText(f)}`))
       }),
       store.on('frameIn', (f) => {
-        const keepalive = f.type === MsgType.Ok && pingTags.delete(f.tag)
+        // forget the tag on either reply, but still print an ERR (eg. EUNKNOWN_CMD to RADIO_STATUS)
+        const keepalive = (f.type === MsgType.Ok || f.type === MsgType.Err) && keepaliveTags.delete(f.tag) && f.type === MsgType.Ok
         if (flags.frames === 'all' || (flags.frames === 'on' && !keepalive)) out(C.dim(`<- ${frameText(f)}`))
       }),
     ]

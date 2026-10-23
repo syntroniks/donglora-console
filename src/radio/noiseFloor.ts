@@ -1,14 +1,16 @@
 // Noise floor tracking. No DOM.
 //
-// DongLoRa v1.0 has no instantaneous-RSSI command, so today the only input is per-packet: RSSI averaged
-// over the packet (signal + noise) and SNR. Firmware 1.5.2 rounds both to whole dB before scaling by 10
-// (firmware/src/radio.rs, lora-phy sx126x), so nothing here claims finer precision. The noise in a packet
-// is RSSI minus the signal's share of the power:
+// Two inputs. Protocol v1.1's RADIO_STATUS (firmware 1.6.0) reads the SX126x instantaneous RSSI between
+// packets, in 0.5 dB steps; the client polls it as its keepalive, and those samples are 'measured'.
+// Without it (DongLoRa 1.5.2, protocol v1.0) the only input is per-packet: RSSI averaged over the packet
+// (signal + noise) and SNR, both rounded to whole dB before scaling by 10 (firmware/src/radio.rs, lora-phy
+// sx126x), so nothing here claims finer precision. The noise in a packet is RSSI minus the signal's share
+// of the power:
 //   N = RSSI − 10·log10(1 + 10^(SNR/10))
 // which holds for negative SNR too (SNR −10 dB: N ≈ RSSI − 0.4).
 //
-// A future firmware could report measured RSSI between packets; samples carry their source, and measured
-// ones take over as soon as they arrive.
+// Samples carry their source; measured ones take over while they keep arriving, and packet estimates
+// come back when they stop (eg. RX stopped: RADIO_STATUS reports no RSSI outside continuous RX).
 //
 // The floor itself copies MeshCore (src/helpers/radiolib/RadioLibWrappers.cpp loop()): start unset, add
 // only samples below floor + 14 dB (any sample while unset), and after 64 of them set the floor to their
@@ -19,7 +21,7 @@ export type NoiseSource = 'packet-estimate' | 'measured'
 
 export const NOISE_SOURCE_LABELS: Record<NoiseSource, string> = {
   'packet-estimate': 'estimated from packets',
-  measured: 'measured RSSI',
+  measured: 'measured (RADIO_STATUS)',
 }
 
 export interface NoiseSample {
@@ -117,8 +119,8 @@ export class NoiseFloorTracker {
     return m && now - m.at < MEASURED_STALE_MS ? 'measured' : 'packet-estimate'
   }
 
-  snapshot(now = Date.now()): NoiseFloorState {
-    const source = this.source(now)
+  /** The source in use, or the one asked for. */
+  snapshot(now = Date.now(), source = this.source(now)): NoiseFloorState {
     const t = this.trackers[source]
     return {
       source,

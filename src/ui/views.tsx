@@ -3,11 +3,12 @@ import { CAPABILITY_NAMES, MODULATION_NAMES, OWNER_NAMES, RADIO_CHIP_NAMES, SET_
 import { LINK_ERROR_NAMES } from '../protocol/client.ts'
 import { bwKHz, mhz, supportedBws, supportedSfs } from '../protocol/lora.ts'
 import type { DecodeStage } from '../meshcore/decode.ts'
+import { TX_POWER_MEANING_LABELS, txPowerMeaning } from '../radio/frontEnd.ts'
 import { MEDIAN_WINDOW, NOISE_SOURCE_LABELS, NUM_NOISE_FLOOR_SAMPLES } from '../radio/noiseFloor.ts'
 import { NoiseChart } from './NoiseChart.tsx'
 import { configRows } from './configRows.ts'
 import { Card, Empty, Rows } from './parts.tsx'
-import type { RadioState } from './store.ts'
+import { radioStatusAvailable, type RadioState } from './store.ts'
 import { ago, coords, db, dbm, duration, level, plural, shortKey, time } from './format.ts'
 
 /** re-render every second, for "x ago" and uptime */
@@ -43,6 +44,10 @@ export function Overview({ state }: { state: RadioState }) {
     : []
   const failed = st.status.partial + st.status.undecodable
   const keepaliveOk = h && h.lastOkAt && now - h.lastOkAt < 2000
+  const keepaliveCmd = h?.command ?? 'PING'
+  const power = txPowerMeaning(info, state.radioStatus)
+  // LoRa header errors the radio counted since this connection's first RADIO_STATUS (or a stats reset)
+  const headerErrs = state.radioStatus && state.countersBase ? state.radioStatus.rxHeaderErr - state.countersBase.rxHeaderErr : undefined
   return (
     <div className="grid">
       <Card title="Connection">
@@ -64,7 +69,7 @@ export function Overview({ state }: { state: RadioState }) {
               { label: 'Radio', value: `${RADIO_CHIP_NAMES[info.radioChipId] ?? 'unknown'} (0x${info.radioChipId.toString(16).padStart(4, '0')})` },
               { label: 'Capabilities', value: `${caps.join(', ')} (0x${info.capabilities.toString(16)})` },
               { label: 'Frequency', value: `${mhz(info.freqMinHz)}–${mhz(info.freqMaxHz)} MHz` },
-              { label: 'TX power', value: `${info.txPowerMinDbm}…${info.txPowerMaxDbm} dBm` },
+              { label: 'TX power', value: `${info.txPowerMinDbm}…${info.txPowerMaxDbm} dBm${power === 'unknown' ? '' : ` (${TX_POWER_MEANING_LABELS[power]})`}` },
               { label: 'SF', value: supportedSfs(info).map((s) => `SF${s}`).join(' ') },
               { label: 'Bandwidth', value: `${supportedBws(info).map(bwKHz).join(', ')} kHz` },
               { label: 'Max payload', value: `${info.maxPayloadBytes} bytes` },
@@ -111,7 +116,14 @@ export function Overview({ state }: { state: RadioState }) {
             “CRC fail” only shows up with other firmware or the demo radio.
           </p>
         )}
+        {info && (info.firmware.major > 1 || info.firmware.minor >= 6) && (
+          <p className="muted small">
+            DongLoRa {info.firmware.major}.{info.firmware.minor}.{info.firmware.patch} delivers packets whose CRC failed (shown as CRC fail) and
+            reports the SX126x frequency error in Hz. RSSI and SNR are still whole dB.
+          </p>
+        )}
       </Card>
+      <CountersCard state={state} now={now} />
       <NoiseCard state={state} now={now} />
       <Card title="Decode results">
         <Rows
@@ -120,10 +132,16 @@ export function Overview({ state }: { state: RadioState }) {
             { label: 'Partial', value: <span className={st.status.partial ? 'warn' : undefined}>{st.status.partial}</span> },
             { label: 'Undecodable', value: <span className={st.status.undecodable ? 'err' : undefined}>{st.status.undecodable}</span> },
             { label: 'No key', value: st.status['no-key'], muted: true },
+            ...(headerErrs !== undefined
+              ? [{ label: '  LoRa header (radio count, no bytes)', value: <span className={headerErrs ? 'err' : 'muted'}>{headerErrs}</span> }]
+              : []),
             ...STAGES.map((s) => ({ label: `  ${s.label}`, value: <span className={st.stages[s.stage] ? 'err' : 'muted'}>{st.stages[s.stage] ?? 0}</span> })),
           ]}
         />
-        <p className="muted small">{failed} failed of {st.rx}; CRC-failed packets are decoded too, and counted here.</p>
+        <p className="muted small">
+          {failed} failed of {st.rx}; CRC-failed packets are decoded too, and counted here.
+          {headerErrs !== undefined && ' LoRa header errors come from the radio’s counter (RADIO_STATUS, since connect): the header didn’t decode, so no bytes reach the host and they aren’t in the RX count.'}
+        </p>
       </Card>
       <Card title={`Link errors (${st.linkTotal})`}>
         <Rows rows={Object.entries(LINK_ERROR_NAMES).map(([k, name]) => ({ label: name, value: <span className={st.link[k as keyof typeof st.link] ? 'err' : 'muted'}>{st.link[k as keyof typeof st.link] ?? 0}</span> }))} />
@@ -132,8 +150,8 @@ export function Overview({ state }: { state: RadioState }) {
         {h ? (
           <Rows
             rows={[
-              { label: 'Health', value: keepaliveOk ? <span className="ok">ok</span> : <span className="err">no PING reply for {ago(h.lastOkAt, now)}</span> },
-              { label: 'PINGs', value: `${h.pings} ok, ${h.failures} failed` },
+              { label: 'Health', value: keepaliveOk ? <span className="ok">ok</span> : <span className="err">no {keepaliveCmd} reply for {ago(h.lastOkAt, now)}</span> },
+              { label: 'Keepalives', value: `${h.pings} ok, ${h.failures} failed · ${keepaliveCmd}` },
               { label: 'Round trip', value: h.lastRttMs !== undefined ? `${h.lastRttMs.toFixed(1)} ms (avg ${h.avgRttMs?.toFixed(1)})` : '…' },
               { label: 'Longest write gap', value: <span className={h.maxGapMs > 900 ? 'err' : undefined}>{h.maxGapMs} ms</span> },
               { label: 'Sessions lost', value: <span className={h.lostSessions ? 'warn' : undefined}>{h.lostSessions} ({h.recoveries} restored)</span> },
@@ -142,7 +160,10 @@ export function Overview({ state }: { state: RadioState }) {
         ) : (
           <Empty>Starts once connected.</Empty>
         )}
-        <p className="muted small">The dongle resets after 1000 ms without a frame. PINGs go every 400 ms from a Worker timer, so a background tab keeps them.</p>
+        <p className="muted small">
+          The dongle resets after 1000 ms without a frame. A keepalive goes every 400 ms from a Worker timer, so a background tab keeps it:
+          RADIO_STATUS when the firmware has it (1.6.0), which also samples RSSI and the front end, otherwise PING.
+        </p>
       </Card>
       <Card title="Session log">
         {state.log.length ? (
@@ -230,9 +251,63 @@ export function Channel({ state }: { state: RadioState }) {
   )
 }
 
+/** Device counter with how far it moved since this connection's first RADIO_STATUS (or a stats reset). */
+function counter(value: number, base: number | undefined, bad = false) {
+  return (
+    <span className={bad && value ? 'err' : undefined}>
+      {value}
+      {base !== undefined && <span className="muted"> (+{value - base})</span>}
+    </span>
+  )
+}
+
+function CountersCard({ state, now }: { state: RadioState; now: number }) {
+  const s = state.radioStatus
+  const b = state.countersBase
+  const total = s ? s.rxOk + s.rxCrcErr : 0
+  let empty = 'Starts once connected.'
+  if (state.radioStatusRefused) empty = 'The device advertises RADIO_STATUS but answered EUNKNOWN_CMD, so there are no device counters.'
+  else if (state.info && !radioStatusAvailable(state)) empty = 'This firmware has no RADIO_STATUS (DongLoRa 1.6.0, protocol v1.1, adds it), so there are no device counters.'
+  else if (state.info) empty = 'Waiting for the first RADIO_STATUS reply.'
+  return (
+    <Card title="Radio counters (device, since boot)">
+      {s ? (
+        <>
+          <Rows
+            rows={[
+              { label: 'Good CRC', value: counter(s.rxOk, b?.rxOk) },
+              {
+                label: 'CRC errors',
+                value: (
+                  <>
+                    {counter(s.rxCrcErr, b?.rxCrcErr, true)}
+                    {total ? <span className="muted"> · {((s.rxCrcErr / total) * 100).toFixed(1)}% of packets</span> : null}
+                  </>
+                ),
+              },
+              { label: 'Header errors', value: counter(s.rxHeaderErr, b?.rxHeaderErr, true) },
+              { label: 'Updated', value: ago(state.radioStatusAt, now) },
+            ]}
+          />
+          <p className="muted small">
+            Counted by the dongle since it booted, not by this console; (+n) is since this connection’s first RADIO_STATUS or the last stats reset.
+            CRC errors also arrive as RX events with crc_valid = 0 and are in the console’s counts. Header errors are packets that failed to decode
+            at the LoRa header: they never reach the host, so there are no bytes to show.
+          </p>
+        </>
+      ) : (
+        <Empty>{empty}</Empty>
+      )}
+    </Card>
+  )
+}
+
 function NoiseCard({ state, now }: { state: RadioState; now: number }) {
   const n = state.noise
-  const badge = <span className={`badge-s ${n.source === 'measured' ? 'badge-measured' : 'badge-source'}`}>{NOISE_SOURCE_LABELS[n.source]}</span>
+  const measured = n.source === 'measured'
+  const available = radioStatusAvailable(state)
+  const rs = state.radioStatus
+  const badge = <span className={`badge-s ${measured ? 'badge-measured' : 'badge-source'}`}>{NOISE_SOURCE_LABELS[n.source]}</span>
   return (
     <div className="card-span">
       <Card title="Noise floor" actions={badge}>
@@ -244,16 +319,33 @@ function NoiseCard({ state, now }: { state: RadioState; now: number }) {
               muted: n.floor === undefined,
             },
             { label: `Median, last ${MEDIAN_WINDOW}`, value: n.median !== undefined ? `${n.median} dBm (${n.medianCount} sample${n.medianCount === 1 ? '' : 's'})` : '…', muted: n.median === undefined },
-            { label: 'Last update', value: n.last ? `${Math.round(n.last.dbm)} dBm · ${ago(n.last.at, now)}` : 'no samples yet', muted: !n.last },
+            { label: 'Last update', value: n.last ? `${measured ? level(n.last.dbm) : Math.round(n.last.dbm)} dBm · ${ago(n.last.at, now)}` : 'no samples yet', muted: !n.last },
             { label: 'Samples', value: `${n.accepted} used, ${n.rejected} over floor + 14 dB` },
+            ...(available
+              ? [{
+                  label: 'RSSI now (RADIO_STATUS)',
+                  value: rs ? (rs.rssiInst !== null ? `${level(rs.rssiInst)} dBm` : 'none: the radio isn’t in continuous RX') : 'no reply yet',
+                  muted: !rs || rs.rssiInst === null,
+                }]
+              : []),
           ]}
         />
-        <NoiseChart points={state.noiseHistory} />
-        <p className="note">
-          No DongLoRa command reads instantaneous RSSI yet, so each packet’s noise is estimated as RSSI − 10·log10(1 + 10^(SNR/10)),
-          from whole-dB values (±1 dB at best). The floor uses MeshCore’s method: 64 samples under floor + 14 dB, averaged,
-          clamped at −120 dBm. Packets with a failed CRC are left out.
-        </p>
+        <NoiseChart points={state.noiseHistory} measured={state.measuredHistory} />
+        {measured ? (
+          <p className="note">
+            RADIO_STATUS reads the SX1262’s instantaneous RSSI with every keepalive, about twice a second, in 0.5 dB steps. The floor uses
+            MeshCore’s method: 64 samples under floor + 14 dB, averaged, clamped at −120 dBm, so readings taken during a packet are left out once
+            there is a floor. The Packets table still shows each packet’s own estimate.
+          </p>
+        ) : (
+          <p className="note">
+            {available
+              ? 'RADIO_STATUS only reads RSSI while the radio is in continuous RX, so for now each packet’s noise is estimated instead'
+              : 'This firmware has no RADIO_STATUS (DongLoRa 1.6.0 adds it), so each packet’s noise is estimated'}{' '}
+            as RSSI − 10·log10(1 + 10^(SNR/10)), from whole-dB values (±1 dB at best). The floor uses MeshCore’s method: 64 samples under
+            floor + 14 dB, averaged, clamped at −120 dBm. Packets with a failed CRC are left out.
+          </p>
+        )}
       </Card>
     </div>
   )

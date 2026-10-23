@@ -1,8 +1,10 @@
 // A simulated DongLoRa dongle for demo mode and tests. It speaks the real wire protocol: COBS frames with
 // CRCs, the UNCONFIGURED / CONFIGURED state machine with its 1000 ms inactivity timer, the same GET_INFO
-// as a Heltec V4 on firmware 1.5.2, and the same errors. While receiving on the MeshCore USA/Canada
-// settings it hears a small mesh: signed adverts, Public channel posts that decrypt, acks and DMs, and
-// (with failures on) one of every kind of broken packet and broken frame the console reports.
+// as a Heltec V4.2 on firmware 1.6.0 (protocol v1.1, or 1.5.2 with the info option), and the same errors.
+// RADIO_STATUS answers with the band's RSSI while receiving, a powered GC1109 and climbing RX counters.
+// While receiving on the MeshCore USA/Canada settings it hears a small mesh: signed adverts, Public
+// channel posts that decrypt, acks and DMs, and (with failures on) one of every kind of broken packet,
+// CRC failures included, and broken frame the console reports.
 
 import { sha256 } from '@noble/hashes/sha2.js'
 import { advertPayload, buildPacket, groupTextPacket, groupTextPayload, publicKeyOf } from '../../meshcore/build.ts'
@@ -12,10 +14,21 @@ import { MESHCORE_SYNC_WORD } from '../../meshcore/presets.ts'
 import { ByteWriter } from '../bytes.ts'
 import type { Transport, TransportSink } from '../client.ts'
 import { cobsEncode } from '../cobs.ts'
-import { ErrCode, INACTIVITY_TIMEOUT_MS, Modulation, MsgType, TxResult } from '../codes.ts'
+import { Capability, ErrCode, FemFlag, FemType, INACTIVITY_TIMEOUT_MS, Modulation, MsgType, RxGain, TxResult } from '../codes.ts'
 import { encodeFrame, frameBody, FrameDecoder, type Frame } from '../framing.ts'
 import { airtimeUs, validateConfig } from '../lora.ts'
-import { encodeInfo, encodeRx, LORA_PARAMS_LEN, parseLoRaParams, type DeviceInfo, type LoRaConfig, type RxPacket } from '../messages.ts'
+import {
+  encodeInfo,
+  encodeRadioStatus,
+  encodeRx,
+  hasCapability,
+  LORA_PARAMS_LEN,
+  parseLoRaParams,
+  type DeviceInfo,
+  type LoRaConfig,
+  type RadioStatus,
+  type RxPacket,
+} from '../messages.ts'
 
 /** What a Heltec V4 on DongLoRa 1.5.2 reports (the UID is made up). */
 export const MOCK_INFO: DeviceInfo = {
@@ -34,6 +47,16 @@ export const MOCK_INFO: DeviceInfo = {
   txPowerMaxDbm: 22,
   mcuUid: 'd0e0d0e0aa55',
   radioUid: '',
+}
+
+/** A Heltec V4.2 on DongLoRa 1.6.0: protocol v1.1, RADIO_STATUS, and the GC1109's output range at the antenna. */
+export const MOCK_INFO_1_6: DeviceInfo = {
+  ...MOCK_INFO,
+  protocol: { major: 1, minor: 1 },
+  firmware: { major: 1, minor: 6, patch: 0 },
+  capabilities: MOCK_INFO.capabilities | (1n << BigInt(Capability.RadioStatus)),
+  txPowerMinDbm: 2,
+  txPowerMaxDbm: 28,
 }
 
 export const GOOD_KINDS = ['advert', 'group-text', 'text', 'ack', 'path'] as const
@@ -66,6 +89,8 @@ export interface MockOptions {
   intervalMs?: [number, number]
   /** share of TXs that find the channel busy (default 0.1) */
   busyRate?: number
+  /** what GET_INFO reports (default MOCK_INFO_1_6); without capability bit 33, RADIO_STATUS is EUNKNOWN_CMD */
+  info?: DeviceInfo
 }
 
 interface Node {
@@ -105,7 +130,7 @@ export class MockDongLoRaTransport implements Transport {
   private inactivity: ReturnType<typeof setTimeout> | null = null
   private txQueue: { tag: number; len: number }[] = []
   private txBusy = false
-  readonly info: DeviceInfo = MOCK_INFO
+  readonly info: DeviceInfo
 
   config: LoRaConfig | null = null
   receiving = false
@@ -113,11 +138,16 @@ export class MockDongLoRaTransport implements Transport {
   readonly received: Frame[] = []
   /** how many times the inactivity timer fired */
   timeouts = 0
-  /** the band's noise floor, wandering slowly between -115 and -105 dBm */
-  noiseFloorDbm = -115 + Math.random() * 10
+  /** the band's noise floor, wandering slowly between -114 and -110 dBm */
+  noiseFloorDbm = -113 + Math.random() * 2
+  /** RX counters since "boot": the dongle was up before the host connected */
+  rxOk = 20 + Math.floor(Math.random() * 40)
+  rxCrcErr = 1 + Math.floor(Math.random() * 5)
+  rxHeaderErr = 3 + Math.floor(Math.random() * 10)
 
   constructor(options: MockOptions = {}) {
     this.options = options
+    this.info = options.info ?? MOCK_INFO_1_6
     this.decoder = new FrameDecoder(() => {
       this.touch() // a bad frame still proves the host is there (§3.4)
       this.send(MsgType.Err, 0, new ByteWriter().u16(ErrCode.Frame).toBytes())
@@ -239,6 +269,11 @@ export class MockDongLoRaTransport implements Transport {
         if (!this.config) return this.err(tag, ErrCode.NotConfigured)
         this.receiving = false
         return this.ok(tag)
+      case MsgType.RadioStatus:
+        // older firmware doesn't know the command at all
+        if (!hasCapability(this.info, Capability.RadioStatus)) return this.err(tag, ErrCode.UnknownCmd)
+        if (p.length) return this.err(tag, ErrCode.Length)
+        return this.ok(tag, encodeRadioStatus(this.radioStatus()))
       default:
         return this.err(tag, ErrCode.UnknownCmd)
     }
@@ -259,7 +294,31 @@ export class MockDongLoRaTransport implements Transport {
     })
   }
 
+  /** What RADIO_STATUS reads now. RSSI only in continuous RX, now and then in the middle of a packet. */
+  radioStatus(): RadioStatus {
+    let rssiInst: number | null = null
+    if (this.receiving) {
+      this.drift(0.2)
+      const onAir = Math.random() < 0.06
+      const dbm = this.noiseFloorDbm + (onAir ? 15 + Math.random() * 30 : (Math.random() - 0.5) * 3)
+      rssiInst = Math.round(dbm * 2) / 2 // the SX126x reads RSSI in 0.5 dB steps
+    }
+    return {
+      rssiInst,
+      rxGain: RxGain.Boosted,
+      femType: FemType.Gc1109,
+      femFlags: FemFlag.Powered | FemFlag.Lna | FemFlag.Pa,
+      rxOk: this.rxOk,
+      rxCrcErr: this.rxCrcErr,
+      rxHeaderErr: this.rxHeaderErr,
+    }
+  }
+
   // ---- the air ----
+
+  private drift(step: number): void {
+    this.noiseFloorDbm = Math.min(-110, Math.max(-114, this.noiseFloorDbm + (Math.random() - 0.5) * step))
+  }
 
   /** whether the radio is tuned to the simulated mesh */
   private onMesh(): boolean {
@@ -272,20 +331,23 @@ export class MockDongLoRaTransport implements Transport {
     if (!this.onMesh()) {
       // off the mesh's settings: only the odd burst of noise
       if (Math.random() < 0.15) this.inject('crc-fail')
+      else if (Math.random() < 0.2) this.rxHeaderErr++
       return
     }
+    // a preamble whose LoRa header didn't decode: counted, never delivered
+    if (this.options.failures && Math.random() < 0.1) this.rxHeaderErr++
     const failing = this.options.failures && Math.random() < 0.3
-    this.inject(failing ? pick(FAILURE_KINDS) : pick(GOOD_KINDS))
+    this.inject(failing ? (Math.random() < 0.15 ? 'crc-fail' : pick(FAILURE_KINDS)) : pick(GOOD_KINDS))
   }
 
   /** Emit one RX event of the given kind now. False when the radio isn't receiving. */
   inject(kind: PacketKind): boolean {
     if (!this.receiving) return false
-    this.noiseFloorDbm = Math.min(-105, Math.max(-115, this.noiseFloorDbm + (Math.random() - 0.5) * 0.8))
+    this.drift(0.8)
     const n = this.noiseFloorDbm
     // most packets 5-30 dB over the floor, some under it (LoRa decodes down to about -7.5 dB at SF7)
     const snr = kind === 'crc-fail' ? -13 + Math.random() * 6 : Math.random() < 0.12 ? -7 + Math.random() * 6 : 5 + Math.random() * 25
-    // RSSI over the packet is signal plus noise; firmware 1.5.2 rounds both to whole dB
+    // RSSI over the packet is signal plus noise; the firmware rounds both to whole dB
     const rssi = 10 * Math.log10(10 ** ((n + snr) / 10) + 10 ** (n / 10))
     const rx: RxPacket = {
       rssi: Math.round(rssi),
@@ -297,6 +359,8 @@ export class MockDongLoRaTransport implements Transport {
       origin: 0,
       data: this.packet(kind),
     }
+    if (rx.crcValid) this.rxOk++
+    else this.rxCrcErr++
     this.send(MsgType.Rx, 0, encodeRx(rx))
     return true
   }

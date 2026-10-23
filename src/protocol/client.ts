@@ -5,20 +5,23 @@
 // has gone out. RX events and async errors carry tag 0.
 //
 // The device drops to UNCONFIGURED after 1000 ms without a frame, so the client owns a keepalive that
-// PINGs when nothing else has been written for KEEPALIVE_MS. A PING still succeeds after a timeout, so
-// the client also notices gaps in its own writes and probes the session, and on ENOTCONFIGURED it
-// re-sends the last config and restarts RX (§14.2).
+// writes when nothing else has been written for KEEPALIVE_MS: RADIO_STATUS when GET_INFO advertises it
+// (v1.1, capability bit 33), which also samples RSSI and the front end, otherwise PING. Both still succeed
+// after a timeout, so the client also notices gaps in its own writes and probes the session, and on
+// ENOTCONFIGURED it re-sends the last config and restarts RX (§14.2).
 //
 // Nothing that arrives is dropped quietly: frames that fail to decode, unknown types, async errors and
 // replies nobody is waiting for are all reported as 'linkError'.
 
 import { toHex } from './bytes.ts'
-import { ERR_CODE_NAMES, ERR_CODE_TEXT, ErrCode, INACTIVITY_TIMEOUT_MS, MSG_TYPE_NAMES, MsgType } from './codes.ts'
+import { Capability, ERR_CODE_NAMES, ERR_CODE_TEXT, ErrCode, INACTIVITY_TIMEOUT_MS, MSG_TYPE_NAMES, MsgType } from './codes.ts'
 import { encodeFrame, frameBody, FrameDecoder, type Frame, type FrameFault, type FrameFaultKind } from './framing.ts'
 import { airtimeUs } from './lora.ts'
 import {
+  hasCapability,
   parseErr,
   parseInfo,
+  parseRadioStatus,
   parseRx,
   parseSetConfigReply,
   parseTxDone,
@@ -26,6 +29,7 @@ import {
   txPayload,
   type DeviceInfo,
   type LoRaConfig,
+  type RadioStatus,
   type RxPacket,
   type SetConfigReply,
   type TxDone,
@@ -91,8 +95,10 @@ export const LINK_ERROR_NAMES: Record<LinkErrorKind, string> = {
 }
 
 export interface KeepaliveHealth {
-  pings: number
-  failures: number // PINGs that timed out or failed
+  /** what the keepalive sends: RADIO_STATUS when the device has it, else PING */
+  command: 'PING' | 'RADIO_STATUS'
+  pings: number // keepalives answered, PING or RADIO_STATUS
+  failures: number // keepalives that timed out or failed
   lastRttMs?: number
   avgRttMs?: number
   lastOkAt?: number
@@ -113,13 +119,17 @@ export interface ClientEvents {
   sessionLost: (reason: string) => void
   recovered: (reply: SetConfigReply) => void
   keepalive: (health: KeepaliveHealth) => void
+  /** every RADIO_STATUS reply, from the keepalive or a direct call */
+  radioStatus: (status: RadioStatus) => void
+  /** GET_INFO advertised RADIO_STATUS but the device answered EUNKNOWN_CMD; the keepalive is back on PING */
+  radioStatusUnsupported: (reason: string) => void
   close: (error?: Error) => void
 }
 
 export interface ClientOptions {
   /** per-command timeout (§14.2 suggests 2000 ms) */
   timeoutMs?: number
-  /** write a PING when nothing has been written for this long (§14.2: 500 ms or better) */
+  /** write a keepalive when nothing has been written for this long (§14.2: 500 ms or better) */
   keepaliveMs?: number
   ticker?: TickerFactory
 }
@@ -135,7 +145,7 @@ interface Pending {
 }
 
 const TICK_MS = 100
-const MAX_PINGS_IN_FLIGHT = 4
+const MAX_KEEPALIVES_IN_FLIGHT = 4
 /** a write gap this long means the device may have hit its 1000 ms timeout */
 const GAP_SUSPECT_MS = INACTIVITY_TIMEOUT_MS - 100
 /** time allowed for CAD before a TX starts, on top of airtime */
@@ -157,6 +167,8 @@ export class DongLoRaClient {
     sessionLost: new Set(),
     recovered: new Set(),
     keepalive: new Set(),
+    radioStatus: new Set(),
+    radioStatusUnsupported: new Set(),
     close: new Set(),
   }
   private readonly pending = new Map<number, Pending>()
@@ -165,8 +177,9 @@ export class DongLoRaClient {
   private open = false
   private ticker: Ticker | null = null
   private lastWriteAt = 0
-  private pingsInFlight = 0
-  private lastPingSentAt = 0
+  private keepalivesInFlight = 0
+  private lastKeepaliveAt = 0
+  private radioStatusRefused = false
   private probing = false
   private recovering: Promise<void> | null = null
   private rttSum = 0
@@ -178,7 +191,7 @@ export class DongLoRaClient {
   /** the config to restore after a lost session */
   wanted?: LoRaConfig
   rxWanted = false
-  readonly health: KeepaliveHealth = { pings: 0, failures: 0, maxGapMs: 0, lostSessions: 0, recoveries: 0 }
+  readonly health: KeepaliveHealth = { command: 'PING', pings: 0, failures: 0, maxGapMs: 0, lostSessions: 0, recoveries: 0 }
 
   constructor(transport: Transport, options: ClientOptions = {}) {
     this.transport = transport
@@ -194,6 +207,11 @@ export class DongLoRaClient {
 
   get isOpen(): boolean {
     return this.open
+  }
+
+  /** GET_INFO sets capability bit 33 (firmware 1.6.0, protocol v1.1), and the device hasn't refused it */
+  get radioStatusSupported(): boolean {
+    return !!this.info && hasCapability(this.info, Capability.RadioStatus) && !this.radioStatusRefused
   }
 
   on<K extends keyof ClientEvents>(event: K, listener: ClientEvents[K]): () => void {
@@ -389,6 +407,27 @@ export class DongLoRaClient {
     return this.info
   }
 
+  /**
+   * Instantaneous RSSI, RX gain, front-end state and RX counters (v1.1). Resolves undefined without sending
+   * anything when GET_INFO doesn't advertise it, and when the device answers EUNKNOWN_CMD anyway; after
+   * that the keepalive goes back to PING.
+   */
+  async radioStatus(): Promise<RadioStatus | undefined> {
+    if (!this.radioStatusSupported) return undefined
+    let payload: Uint8Array
+    try {
+      payload = await this.command(MsgType.RadioStatus)
+    } catch (err) {
+      if (!(err instanceof DongLoRaError && err.code === ErrCode.UnknownCmd)) throw err
+      this.radioStatusRefused = true
+      this.emit('radioStatusUnsupported', 'GET_INFO advertises RADIO_STATUS, but the device answered EUNKNOWN_CMD; keepalive is back on PING')
+      return undefined
+    }
+    const status = this.parse('RADIO_STATUS', payload, parseRadioStatus)
+    this.emit('radioStatus', status)
+    return status
+  }
+
   /** Configure the radio. The reply echoes what the radio is actually running. */
   async setConfig(config: LoRaConfig): Promise<SetConfigReply> {
     this.wanted = config
@@ -482,10 +521,10 @@ export class DongLoRaClient {
       void this.probe(idle)
       return
     }
-    // keep writing on schedule even if earlier PINGs haven't been answered: the device only needs frames
-    // to arrive, and one lost reply must not hold the next PING for a whole command timeout
-    if (idle >= this.keepaliveMs && this.pingsInFlight < MAX_PINGS_IN_FLIGHT && Date.now() - this.lastPingSentAt >= this.keepaliveMs) {
-      void this.keepalivePing()
+    // keep writing on schedule even if earlier keepalives haven't been answered: the device only needs frames
+    // to arrive, and one lost reply must not hold the next keepalive for a whole command timeout
+    if (idle >= this.keepaliveMs && this.keepalivesInFlight < MAX_KEEPALIVES_IN_FLIGHT && Date.now() - this.lastKeepaliveAt >= this.keepaliveMs) {
+      void this.keepalive()
     }
   }
 
@@ -502,11 +541,17 @@ export class DongLoRaClient {
     }
   }
 
-  private async keepalivePing(): Promise<void> {
-    this.pingsInFlight++
-    this.lastPingSentAt = Date.now()
+  /** RADIO_STATUS stands in for PING when the device has it: any frame resets the inactivity timer. */
+  private async keepalive(): Promise<void> {
+    this.keepalivesInFlight++
+    this.lastKeepaliveAt = Date.now()
+    const status = this.radioStatusSupported
+    this.health.command = status ? 'RADIO_STATUS' : 'PING'
     try {
-      const rtt = await this.ping()
+      const t0 = performance.now()
+      if (status) await this.radioStatus()
+      else await this.command(MsgType.Ping)
+      const rtt = performance.now() - t0
       this.health.pings++
       this.health.lastRttMs = rtt
       this.health.lastOkAt = Date.now()
@@ -516,7 +561,7 @@ export class DongLoRaClient {
     } catch {
       if (this.open) this.health.failures++
     } finally {
-      this.pingsInFlight--
+      this.keepalivesInFlight--
       this.emit('keepalive', this.health)
     }
   }

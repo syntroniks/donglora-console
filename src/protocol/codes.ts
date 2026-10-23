@@ -1,4 +1,4 @@
-// DongLoRa Protocol v1.0 constants (protocol-rs/PROTOCOL.md).
+// DongLoRa Protocol v1.1 constants (protocol-rs/PROTOCOL.md). v1.1 adds RADIO_STATUS (firmware 1.6.0).
 
 /** Message type byte (§4). Host commands have the MSB clear, device frames have it set. */
 export const MsgType = {
@@ -8,6 +8,8 @@ export const MsgType = {
   Tx: 0x04,
   RxStart: 0x05,
   RxStop: 0x06,
+  /** v1.1, only when GET_INFO sets Capability.RadioStatus */
+  RadioStatus: 0x07,
   Ok: 0x80,
   Err: 0x81,
   Rx: 0xc0,
@@ -21,6 +23,7 @@ export const MSG_TYPE_NAMES: Record<number, string> = {
   0x04: 'TX',
   0x05: 'RX_START',
   0x06: 'RX_STOP',
+  0x07: 'RADIO_STATUS',
   0x80: 'OK',
   0x81: 'ERR',
   0xc0: 'RX',
@@ -102,9 +105,10 @@ export const CAPABILITY_NAMES: Record<number, string> = {
   21: 'spectral scan',
   22: 'full duplex',
   32: 'multi-client',
+  33: 'RADIO_STATUS',
 }
 
-export const Capability = { LoRa: 0, Cad: 16, IqInvert: 17, FullDuplex: 22, MultiClient: 32 } as const
+export const Capability = { LoRa: 0, Cad: 16, IqInvert: 17, FullDuplex: 22, MultiClient: 32, RadioStatus: 33 } as const
 
 /** §10 */
 export const Modulation = { LoRa: 0x01, Fsk: 0x02, LrFhss: 0x03, Flrc: 0x04 } as const
@@ -123,6 +127,26 @@ export const OWNER_NAMES = ['NONE', 'MINE', 'OTHER']
 
 export const TxResult = { Transmitted: 0, ChannelBusy: 1, Cancelled: 2 } as const
 export const TX_RESULT_NAMES = ['TRANSMITTED', 'CHANNEL_BUSY', 'CANCELLED']
+
+/** RADIO_STATUS rx_gain: the SX126x RX gain register 0x08AC. */
+export const RxGain = { PowerSaving: 0, Boosted: 1, Unknown: 0xff } as const
+export const RX_GAIN_NAMES: Record<number, string> = {
+  0: 'power saving (0x94 in reg 0x08AC)',
+  1: 'boosted (0x96 in reg 0x08AC)',
+  0xff: 'unknown (reg 0x08AC unreadable or another value)',
+}
+
+/** RADIO_STATUS fem_type: the external front-end module. */
+export const FemType = { None: 0, Gc1109: 1, Kct8103l: 2, Unknown: 0xff } as const
+export const FEM_TYPE_NAMES: Record<number, string> = {
+  0: 'none',
+  1: 'GC1109 (Heltec V4.2)',
+  2: 'KCT8103L (Heltec V4.3)',
+  0xff: 'unknown',
+}
+
+/** RADIO_STATUS fem_flags bits; the others are 0. */
+export const FemFlag = { Powered: 1 << 0, Lna: 1 << 1, Pa: 1 << 2 } as const
 
 /** The device drops to UNCONFIGURED after this long without a frame from the host (§3.4). */
 export const INACTIVITY_TIMEOUT_MS = 1000

@@ -59,7 +59,22 @@ export interface TxDone {
   airtimeUs: number
 }
 
+/** RADIO_STATUS reply (v1.1). Counters run from device boot, not from when the host connected. */
+export interface RadioStatus {
+  /** instantaneous RSSI in dBm (0.5 dB steps), read when the command was handled; null outside continuous RX */
+  rssiInst: number | null
+  rxGain: number // RxGain
+  femType: number // FemType
+  femFlags: number // FemFlag bits
+  rxOk: number // packets with a good CRC
+  rxCrcErr: number // packets with a bad CRC, delivered as RX events with crc_valid = 0
+  rxHeaderErr: number // LoRa header errors, never delivered
+}
+
 export const LORA_PARAMS_LEN = 15
+export const RADIO_STATUS_LEN = 17
+/** rssi_inst when the radio isn't in continuous RX (i16::MIN) */
+export const RSSI_NOT_AVAILABLE = -0x8000
 
 export function hasCapability(info: DeviceInfo, bit: number): boolean {
   return ((info.capabilities >> BigInt(bit)) & 1n) === 1n
@@ -166,6 +181,28 @@ export function encodeRx(rx: RxPacket): Uint8Array {
 export function parseTxDone(p: Uint8Array): TxDone {
   const r = new ByteReader(p)
   return { result: r.u8(), airtimeUs: r.u32() }
+}
+
+/** Longer payloads are fine: a later firmware may append fields (§16.4). */
+export function parseRadioStatus(p: Uint8Array): RadioStatus {
+  const r = new ByteReader(p)
+  const raw = r.i16()
+  return {
+    rssiInst: raw === RSSI_NOT_AVAILABLE ? null : raw / 10,
+    rxGain: r.u8(),
+    femType: r.u8(),
+    femFlags: r.u8(),
+    rxOk: r.u32(),
+    rxCrcErr: r.u32(),
+    rxHeaderErr: r.u32(),
+  }
+}
+
+export function encodeRadioStatus(s: RadioStatus): Uint8Array {
+  return new ByteWriter()
+    .u16(s.rssiInst === null ? RSSI_NOT_AVAILABLE : Math.round(s.rssiInst * 10)).u8(s.rxGain).u8(s.femType).u8(s.femFlags)
+    .u32(s.rxOk).u32(s.rxCrcErr).u32(s.rxHeaderErr)
+    .toBytes()
 }
 
 export function parseErr(p: Uint8Array): number {

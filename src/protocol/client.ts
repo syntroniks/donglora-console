@@ -135,6 +135,7 @@ interface Pending {
 }
 
 const TICK_MS = 100
+const MAX_PINGS_IN_FLIGHT = 4
 /** a write gap this long means the device may have hit its 1000 ms timeout */
 const GAP_SUSPECT_MS = INACTIVITY_TIMEOUT_MS - 100
 /** time allowed for CAD before a TX starts, on top of airtime */
@@ -164,7 +165,8 @@ export class DongLoRaClient {
   private open = false
   private ticker: Ticker | null = null
   private lastWriteAt = 0
-  private pingInFlight = false
+  private pingsInFlight = 0
+  private lastPingSentAt = 0
   private probing = false
   private recovering: Promise<void> | null = null
   private rttSum = 0
@@ -480,7 +482,11 @@ export class DongLoRaClient {
       void this.probe(idle)
       return
     }
-    if (idle >= this.keepaliveMs && !this.pingInFlight) void this.keepalivePing()
+    // keep writing on schedule even if earlier PINGs haven't been answered: the device only needs frames
+    // to arrive, and one lost reply must not hold the next PING for a whole command timeout
+    if (idle >= this.keepaliveMs && this.pingsInFlight < MAX_PINGS_IN_FLIGHT && Date.now() - this.lastPingSentAt >= this.keepaliveMs) {
+      void this.keepalivePing()
+    }
   }
 
   private async probe(idleMs: number): Promise<void> {
@@ -497,7 +503,8 @@ export class DongLoRaClient {
   }
 
   private async keepalivePing(): Promise<void> {
-    this.pingInFlight = true
+    this.pingsInFlight++
+    this.lastPingSentAt = Date.now()
     try {
       const rtt = await this.ping()
       this.health.pings++
@@ -509,7 +516,7 @@ export class DongLoRaClient {
     } catch {
       if (this.open) this.health.failures++
     } finally {
-      this.pingInFlight = false
+      this.pingsInFlight--
       this.emit('keepalive', this.health)
     }
   }

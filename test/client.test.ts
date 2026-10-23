@@ -246,7 +246,7 @@ describe('writes and keepalive', () => {
     await Promise.all(all)
   })
 
-  it('PINGs only when nothing else was written for 400 ms', async () => {
+  it('PINGs when nothing else was written for 400 ms, whether or not the last one was answered', async () => {
     vi.useFakeTimers()
     const { t, tick } = await scripted()
     tick()
@@ -255,9 +255,13 @@ describe('writes and keepalive', () => {
     tick()
     await vi.advanceTimersByTimeAsync(1)
     expect(t.sent.map((f) => f.type)).toEqual([MsgType.Ping])
-    tick() // PING still waiting: no second one
+    tick() // too soon after the last one
     await vi.advanceTimersByTimeAsync(1)
     expect(t.sent).toHaveLength(1)
+    await vi.advanceTimersByTimeAsync(450)
+    tick() // the first PING is still unanswered (its reply was lost): send another anyway
+    await vi.advanceTimersByTimeAsync(1)
+    expect(t.sent.map((f) => f.type)).toEqual([MsgType.Ping, MsgType.Ping])
   })
 
   it('keeps the mock configured for 10 s with the real interval ticker', async () => {

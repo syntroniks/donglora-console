@@ -28,8 +28,10 @@ the requested config (MeshCore USA/Canada unless changed) and starts RX.
 
 `pnpm probe` finds the dongle by USB VID:PID and refuses to open a port that isn't one. It runs GET_INFO, SET_CONFIG
 with the USA/Canada preset and RX_START, prints every RX event for the given time (failed ones with their stage,
-reason and bytes), then RX_STOP and a summary. It never transmits. Only one program can hold the serial port, so
-disconnect the browser first.
+reason and bytes), then RX_STOP and a summary. It never transmits. Disconnect the browser first, and don't connect
+it while the probe runs. The probe's lock doesn't stop Chrome from opening the same tty. When both have it open, replies
+split between them, and Chrome's `PARMRK` setting makes the other reader see every 0xFF byte doubled, which shows up
+as COBS link errors.
 
 ## Safety
 

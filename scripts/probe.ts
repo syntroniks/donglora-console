@@ -120,6 +120,7 @@ async function stop(): Promise<void> {
 process.on('SIGINT', () => void stop())
 
 console.log(`opening ${path} (${match.usbId}${match.serialNumber ? `, serial ${match.serialNumber}` : ''})`)
+console.log("don't connect a browser tab to the dongle while this runs: Chrome can open the port alongside it")
 await client.connect()
 const info = await client.getInfo()
 const caps = Object.entries(CAPABILITY_NAMES).filter(([b]) => ((info.capabilities >> BigInt(b)) & 1n) === 1n).map(([, n]) => n)

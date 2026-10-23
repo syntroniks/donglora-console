@@ -17,6 +17,8 @@ export const LOCAL_COMMANDS: CommandHelp[] = [
   { usage: '/rx start|stop', summary: 'RX_START / RX_STOP on the radio' },
   { usage: '/frames on|all|off', summary: 'hex of frames to and from the dongle (all = with keepalive PINGs)' },
   { usage: '/stats', summary: 'packet, failure and link error counts, keepalive health' },
+  { usage: '/noise', summary: 'noise floor estimate, its source and recent per-packet values' },
+  { usage: '/agc', summary: 'receiver front end: RX gain mode, AGC reset, FEM/LNA (as far as known)' },
   { usage: '/errors', summary: 'the last link errors' },
   { usage: '/nodes', summary: 'nodes heard from their adverts' },
   { usage: '/tx <hex>', summary: 'transmit raw bytes; needs TX armed on the Radio tab, asks to confirm' },

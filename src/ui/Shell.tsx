@@ -10,8 +10,10 @@ import { LINK_ERROR_NAMES } from '../protocol/client.ts'
 import type { Frame } from '../protocol/framing.ts'
 import { bwKHz, describeConfig, mhz, supportedBws, supportedSfs, syncWordHex } from '../protocol/lora.ts'
 import { presetById, PRESETS } from '../meshcore/presets.ts'
+import { FRONT_END_ROWS, FRONT_END_SOURCE_LABELS, frontEndFor } from '../radio/frontEnd.ts'
+import { MEDIAN_WINDOW, NOISE_SOURCE_LABELS, NUM_NOISE_FLOOR_SAMPLES } from '../radio/noiseFloor.ts'
 import { store, type PacketEntry } from './store.ts'
-import { ago, plural, time } from './format.ts'
+import { ago, level, plural, time } from './format.ts'
 
 const C = {
   dim: (s: string) => `\x1b[90m${s}\x1b[0m`,
@@ -26,7 +28,7 @@ const PROMPT_ON = C.accent('dongle') + ' $ '
 
 /** One line per RX event; anything that didn't decode cleanly is red with its reason. */
 function rxLine(p: PacketEntry): string {
-  const meta = `${p.rx.rssi.toFixed(0)} dBm ${p.rx.snr.toFixed(1)} dB ${p.rx.data.length}B`
+  const meta = `${level(p.rx.rssi)} dBm ${level(p.rx.snr)} dB${p.noise !== undefined ? ` noise ${Math.round(p.noise)}` : ''} ${p.rx.data.length}B`
   const m = p.mesh
   const where = m.failure ? ` [${m.failure.stage} @${m.failure.offset}]` : ''
   if (!p.rx.crcValid) return C.err(`[rx] CRC FAIL ${meta}  (untrusted) ${m.status}${where}: ${m.failure ? m.failure.reason : m.summary}`)
@@ -167,6 +169,22 @@ export function Shell() {
           if (h) say(`keepalive ${h.pings} PINGs, ${h.failures} failed, rtt ${h.lastRttMs?.toFixed(1) ?? '-'} ms, longest gap ${h.maxGapMs} ms, sessions lost ${h.lostSessions} (${h.recoveries} restored)`)
           return
         }
+        case 'noise': {
+          const n = s.noise
+          say(`noise floor ${C.dim(`(${NOISE_SOURCE_LABELS[n.source]})`)}`)
+          say(`  MeshCore method  ${n.floor !== undefined ? `${n.floor} dBm, set ${ago(n.floorAt)}` : C.dim(`pending, ${n.pending}/${NUM_NOISE_FLOOR_SAMPLES} samples`)}`)
+          say(`  median last ${MEDIAN_WINDOW}   ${n.median !== undefined ? `${n.median} dBm over ${n.medianCount}` : C.dim('no samples')}`)
+          say(`  last sample      ${n.last ? `${Math.round(n.last.dbm)} dBm, ${ago(n.last.at)}` : C.dim('none')}  (${n.accepted} used, ${n.rejected} over floor + 14 dB)`)
+          const recent = s.packets.filter((p) => p.noise !== undefined).slice(0, 8)
+          if (recent.length) say(`  recent packets   ${recent.map((p) => `${level(p.rx.rssi)}/${level(p.rx.snr)}→${Math.round(p.noise!)}`).join('  ')} ${C.dim('(RSSI/SNR→noise)')}`)
+          return
+        }
+        case 'agc': {
+          const fe = frontEndFor(s.info)
+          say(`receiver front end, firmware ${fe.firmware}, board ${fe.board}${fe.boardAssumed ? C.dim(' (assumed)') : ''}`)
+          for (const { key, label } of FRONT_END_ROWS) say(`  ${label.padEnd(14)} ${fe[key].value} ${C.dim(`[${FRONT_END_SOURCE_LABELS[fe[key].source]}]`)}`)
+          return
+        }
         case 'errors': {
           if (!s.linkErrors.length) return say(C.dim('no link errors'))
           for (const e of s.linkErrors.slice(0, 15).reverse()) say(C.err(`${time(e.at)} ${LINK_ERROR_NAMES[e.kind]}: ${e.reason}`) + C.dim(`  ${toHex(e.bytes.subarray(0, 24), ' ')}`))
@@ -175,7 +193,7 @@ export function Shell() {
         case 'nodes': {
           const nodes = Object.values(s.nodes).sort((a, b) => b.lastHeard - a.lastHeard)
           if (!nodes.length) return say(C.dim('no adverts heard yet'))
-          for (const n of nodes) say(`  ${(n.name || '(no name)').padEnd(22)} ${n.typeName.padEnd(12)} ${plural(n.hops, 'hop').padEnd(7)} ${n.rssi.toFixed(0)} dBm ${C.dim(`${ago(n.lastHeard)} · ${n.publicKey.slice(0, 8)}`)}`)
+          for (const n of nodes) say(`  ${(n.name || '(no name)').padEnd(22)} ${n.typeName.padEnd(12)} ${plural(n.hops, 'hop').padEnd(7)} ${level(n.rssi)} dBm ${C.dim(`${ago(n.lastHeard)} · ${n.publicKey.slice(0, 8)}`)}`)
           return
         }
         case 'tx': {

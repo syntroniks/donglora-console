@@ -16,9 +16,18 @@ export const intervalTicker: TickerFactory = (ms, fn) => {
 
 const WORKER_SOURCE = 'let t; onmessage = (e) => { clearInterval(t); if (e.data > 0) t = setInterval(() => postMessage(0), e.data) }'
 
+// typed here rather than from lib.dom, so scripts compiled for Node can import this module
+interface TickWorker {
+  onmessage: (() => void) | null
+  postMessage(ms: number): void
+  terminate(): void
+}
+const WorkerClass = (globalThis as { Worker?: new (url: string) => TickWorker }).Worker
+
 export const workerTicker: TickerFactory = (ms, fn) => {
+  if (!WorkerClass) throw new Error('no Worker here')
   const url = URL.createObjectURL(new Blob([WORKER_SOURCE], { type: 'text/javascript' }))
-  const worker = new Worker(url)
+  const worker = new WorkerClass(url)
   worker.onmessage = () => fn()
   worker.postMessage(ms)
   return {
@@ -30,7 +39,7 @@ export const workerTicker: TickerFactory = (ms, fn) => {
 }
 
 export const defaultTicker: TickerFactory = (ms, fn) => {
-  if (typeof Worker === 'undefined' || typeof Blob === 'undefined') return intervalTicker(ms, fn)
+  if (!WorkerClass || typeof Blob === 'undefined') return intervalTicker(ms, fn)
   try {
     return workerTicker(ms, fn)
   } catch {

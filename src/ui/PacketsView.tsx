@@ -5,7 +5,7 @@ import type { MeshDecode } from '../meshcore/decode.ts'
 import { HexDump, type HexRegion } from './HexDump.tsx'
 import { Button, Card, Empty, Rows, type Row } from './parts.tsx'
 import type { LinkEntry, PacketEntry } from './store.ts'
-import { coords, db, dbm, hz, time } from './format.ts'
+import { coords, db, dbm, hz, level, time } from './format.ts'
 
 type Filter = 'all' | 'decoded' | 'failed' | 'no-key' | 'crc'
 
@@ -78,14 +78,15 @@ export function Packets({ packets, onClear }: { packets: PacketEntry[]; onClear:
           <div className="table-wrap">
             <table className="table packets">
               <thead>
-                <tr><th>Time</th><th>RSSI</th><th>SNR</th><th>Freq err</th><th>CRC</th><th>Len</th><th>Status</th><th>MeshCore</th></tr>
+                <tr><th>Time</th><th>RSSI</th><th>SNR</th><th title="Noise under the packet: RSSI − 10·log10(1 + 10^(SNR/10)), whole dBm">Noise</th><th>Freq err</th><th>CRC</th><th>Len</th><th>Status</th><th>MeshCore</th></tr>
               </thead>
               <tbody>
                 {rows.map((p) => (
                   <tr key={p.id} className={`${p.rx.crcValid ? '' : 'row-crc'} ${p.id === selected ? 'row-selected' : ''}`} onClick={() => setSelected(p.id === selected ? null : p.id)}>
                     <td className="muted">{time(p.at)}</td>
-                    <td>{p.rx.rssi.toFixed(1)}</td>
-                    <td>{p.rx.snr.toFixed(1)}</td>
+                    <td>{level(p.rx.rssi)}</td>
+                    <td>{level(p.rx.snr)}</td>
+                    <td className="muted">{p.noise !== undefined ? Math.round(p.noise) : '—'}</td>
                     <td className="muted">{p.rx.freqErr}</td>
                     <td>{p.rx.crcValid ? <span className="ok">ok</span> : <span className="err">FAIL</span>}</td>
                     <td>{p.rx.data.length}</td>
@@ -126,6 +127,7 @@ function PacketDetail({ p, onClose }: { p: PacketEntry; onClose: () => void }) {
   const radio: Row[] = [
     { label: 'Received', value: new Date(p.at).toLocaleString() },
     { label: 'RSSI / SNR', value: `${dbm(p.rx.rssi)} · ${db(p.rx.snr)}${p.rx.crcValid ? '' : ' (may be meaningless)'}` },
+    { label: 'Noise under packet', value: p.noise !== undefined ? `≈ ${Math.round(p.noise)} dBm (from RSSI and SNR)` : 'not estimated: the CRC failed, so the SNR is unreliable', muted: p.noise === undefined },
     { label: 'Frequency error', value: hz(p.rx.freqErr) },
     { label: 'Device time', value: `${(p.rx.timestampUs / 1e6).toFixed(3)} s since boot` },
     { label: 'Radio CRC', value: p.rx.crcValid ? <span className="ok">passed</span> : <span className="err">failed: the bytes may be corrupt; the decode below is untrusted</span> },

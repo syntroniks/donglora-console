@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from 'react'
+import { Component, useState, type ReactNode } from 'react'
 
 export function Card({ title, actions, children }: { title: string; actions?: ReactNode; children: ReactNode }) {
   return (
@@ -157,4 +157,23 @@ export function Button({ children, onClick, kind = 'plain', disabled, title }: {
 
 export function Empty({ children }: { children: ReactNode }) {
   return <p className="empty">{children}</p>
+}
+
+/** Keeps one view's crash from unmounting the whole app (and with it the shell). */
+export class ErrorBoundary extends Component<{ children: ReactNode }, { error?: Error }> {
+  state: { error?: Error } = {}
+
+  static getDerivedStateFromError(error: Error) {
+    return { error }
+  }
+
+  render() {
+    if (!this.state.error) return this.props.children
+    return (
+      <div className="banner banner-error">
+        This view crashed: {this.state.error.message}
+        <Button kind="small" onClick={() => this.setState({ error: undefined })}>retry</Button>
+      </div>
+    )
+  }
 }

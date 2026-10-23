@@ -29,7 +29,9 @@ export function time(ms: number): string {
   return new Date(ms).toLocaleTimeString([], { hour12: false })
 }
 
-export const dbm = (v: number) => `${v.toFixed(1)} dBm`
-export const db = (v: number) => `${v > 0 ? '+' : ''}${v.toFixed(1)} dB`
+/** Firmware 1.5.2 reports RSSI and SNR in whole dB (scaled by 10): don't print a decimal it doesn't have. */
+export const level = (v: number) => (Number.isInteger(v) ? `${v}` : v.toFixed(1))
+export const dbm = (v: number) => `${level(v)} dBm`
+export const db = (v: number) => `${v > 0 ? '+' : ''}${level(v)} dB`
 export const hz = (v: number) => `${v > 0 ? '+' : ''}${v} Hz`
 export const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`

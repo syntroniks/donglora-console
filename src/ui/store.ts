@@ -1,6 +1,7 @@
-// Connection state for the whole app, kept outside React so that StrictMode double effects and Fast
+// Connection state for the whole app, held outside React so that StrictMode double effects and Fast
 // Refresh remounts can't open a second port or orphan the first. Components read it with useRadio().
-// On a hot update of this module the open client is handed to the new store instead of being dropped.
+// There is one store per page, kept on globalThis: a hot update of this module (or of anything it
+// imports) keeps the instance, with its client, port and subscribers, and gives it the new code.
 
 import { DongLoRaClient, type KeepaliveHealth, type LinkError, type LinkErrorKind, type Transport } from '../protocol/client.ts'
 import type { Frame } from '../protocol/framing.ts'
@@ -11,6 +12,7 @@ import { validateConfig } from '../protocol/lora.ts'
 import { PUBLIC_CHANNEL } from '../meshcore/crypto.ts'
 import { decodeMeshCore, type DecodeStage, type DecodeStatus, type MeshDecode } from '../meshcore/decode.ts'
 import { DEFAULT_PRESET } from '../meshcore/presets.ts'
+import { NoiseFloorTracker, type NoiseFloorState } from '../radio/noiseFloor.ts'
 
 export type Status = 'disconnected' | 'connecting' | 'connected'
 
@@ -19,6 +21,18 @@ export interface PacketEntry {
   at: number // Date.now() when it arrived
   rx: RxPacket
   mesh: MeshDecode
+  /** noise under this packet, dBm (estimate); undefined when the CRC failed */
+  noise?: number
+}
+
+/** one point per RX event, for the noise chart */
+export interface NoisePoint {
+  at: number
+  rssi: number
+  crcValid: boolean
+  noise?: number
+  floor?: number
+  median?: number
 }
 
 export interface LinkEntry extends LinkError {
@@ -99,6 +113,8 @@ export interface RadioState {
   posts: ChannelPost[]
   log: SessionEvent[]
   txArmed: boolean
+  noise: NoiseFloorState
+  noiseHistory: NoisePoint[]
 }
 
 export interface StoreEvents {
@@ -114,6 +130,7 @@ const PACKETS_MAX = 2000
 const LINK_ERRORS_MAX = 500
 const POSTS_MAX = 500
 const LOG_MAX = 200
+const NOISE_HISTORY_MAX = 600
 
 const emptyStats = (): Stats => ({
   rx: 0,
@@ -140,36 +157,40 @@ const initialState = (requested: LoRaConfig = DEFAULT_PRESET.config): RadioState
   posts: [],
   log: [],
   txArmed: false,
+  noise: new NoiseFloorTracker().snapshot(),
+  noiseHistory: [],
+})
+
+const initialListeners = (): { [K in keyof StoreEvents]: Set<StoreEvents[K]> } => ({
+  packet: new Set(),
+  linkError: new Set(),
+  frameIn: new Set(),
+  frameOut: new Set(),
+  log: new Set(),
+  txDone: new Set(),
 })
 
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err))
-
-interface Handover {
-  state: RadioState
-  client: DongLoRaClient | null
-  nextId: number
-}
 
 export class RadioStore {
   private state: RadioState
   private client: DongLoRaClient | null = null
   private offClient: (() => void)[] = []
   private readonly subscribers = new Set<() => void>()
-  private readonly listeners: { [K in keyof StoreEvents]: Set<StoreEvents[K]> } = {
-    packet: new Set(),
-    linkError: new Set(),
-    frameIn: new Set(),
-    frameOut: new Set(),
-    log: new Set(),
-    txDone: new Set(),
-  }
+  private readonly listeners = initialListeners()
   private nextId = 1
+  private noise = new NoiseFloorTracker()
 
-  constructor(prev?: Handover) {
-    this.state = prev?.state ?? initialState()
-    this.nextId = prev?.nextId ?? 1
-    if (prev?.client?.isOpen) this.attach(prev.client)
-    else if (prev && prev.state.status !== 'disconnected') this.state = { ...prev.state, status: 'disconnected' }
+  constructor() {
+    this.state = initialState()
+  }
+
+  /** After a hot update swapped in new code: give an older instance the fields the new code expects. */
+  upgrade(): void {
+    this.state = { ...initialState(), ...this.state }
+    if (!(this.noise instanceof NoiseFloorTracker)) this.noise = new NoiseFloorTracker()
+    for (const k of Object.keys(initialListeners()) as (keyof StoreEvents)[]) this.listeners[k] ??= new Set() as never
+    for (const fn of this.subscribers) fn()
   }
 
   // ---- React glue ----
@@ -197,13 +218,6 @@ export class RadioStore {
 
   get radio(): DongLoRaClient | null {
     return this.client
-  }
-
-  /** Hot update: give the open client to the next store, and stop listening to it here. */
-  handover(): Handover {
-    this.offClient.forEach((off) => off())
-    this.offClient = []
-    return { state: this.state, client: this.client, nextId: this.nextId }
   }
 
   // ---- connection ----
@@ -366,7 +380,11 @@ export class RadioStore {
 
   private onRx(rx: RxPacket): void {
     const mesh = decodeMeshCore(rx.data, { channels: [PUBLIC_CHANNEL], verifySignatures: true })
-    const entry: PacketEntry = { id: this.nextId++, at: Date.now(), rx, mesh }
+    const at = Date.now()
+    const noiseDbm = this.noise.addPacket(rx.rssi, rx.snr, rx.crcValid, at)
+    const noise = this.noise.snapshot(at)
+    const entry: PacketEntry = { id: this.nextId++, at, rx, mesh, noise: noiseDbm }
+    const point: NoisePoint = { at, rssi: rx.rssi, crcValid: rx.crcValid, noise: noiseDbm, floor: noise.floor, median: noise.median }
     this.patch((s) => {
       const st = { ...s.stats, status: { ...s.stats.status }, stages: { ...s.stats.stages } }
       st.rx++
@@ -384,7 +402,12 @@ export class RadioStore {
         st.snrMax = Math.max(st.snrMax ?? rx.snr, rx.snr)
       }
       st.last = { rssi: rx.rssi, snr: rx.snr, at: entry.at }
-      const next: Partial<RadioState> = { stats: st, packets: [entry, ...s.packets].slice(0, PACKETS_MAX) }
+      const next: Partial<RadioState> = {
+        stats: st,
+        packets: [entry, ...s.packets].slice(0, PACKETS_MAX),
+        noise,
+        noiseHistory: [...s.noiseHistory, point].slice(-NOISE_HISTORY_MAX),
+      }
       // only trust what passed both CRCs and decoded cleanly
       if (rx.crcValid && mesh.status === 'decoded') {
         const a = mesh.advert
@@ -449,7 +472,8 @@ export class RadioStore {
   }
 
   resetStats(): void {
-    this.patch({ stats: emptyStats() })
+    this.noise = new NoiseFloorTracker()
+    this.patch({ stats: emptyStats(), noise: this.noise.snapshot(), noiseHistory: [] })
   }
 
   clearError(): void {
@@ -461,11 +485,16 @@ export class RadioStore {
   }
 }
 
-const hot = import.meta.hot
-export const store = new RadioStore(hot?.data.handover as Handover | undefined)
+const g = globalThis as typeof globalThis & { __dongloraStore?: RadioStore }
 
-if (hot) {
-  hot.dispose((data) => {
-    data.handover = store.handover()
-  })
+function singleton(): RadioStore {
+  const prev = g.__dongloraStore
+  if (!prev) return (g.__dongloraStore = new RadioStore())
+  // Vite re-ran this module: keep the live instance, give it this version's methods. Listeners the client
+  // holds call through `this`, so they reach the new methods too.
+  Object.setPrototypeOf(prev, RadioStore.prototype)
+  prev.upgrade()
+  return prev
 }
+
+export const store = singleton()

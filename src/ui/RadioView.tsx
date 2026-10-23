@@ -4,6 +4,7 @@ import { LORA_BANDWIDTHS_KHZ, LORA_CODING_RATES, TX_RESULT_NAMES } from '../prot
 import { describeConfig, mhz, supportedBws, supportedSfs, syncWordHex, validateConfig } from '../protocol/lora.ts'
 import type { LoRaConfig } from '../protocol/messages.ts'
 import { matchPreset, PRESETS } from '../meshcore/presets.ts'
+import { FRONT_END_ROWS, FRONT_END_SOURCE_LABELS, frontEndFor } from '../radio/frontEnd.ts'
 import { configRows } from './configRows.ts'
 import { Button, Card, Empty, Rows } from './parts.tsx'
 import { store, type RadioState } from './store.ts'
@@ -182,8 +183,33 @@ export function RadioView({ state }: { state: RadioState }) {
         )}
       </Card>
 
+      <FrontEndCard state={state} />
       <TxCard state={state} />
     </div>
+  )
+}
+
+function FrontEndCard({ state }: { state: RadioState }) {
+  const fe = frontEndFor(state.info)
+  return (
+    <Card title="Receiver front end">
+      <Rows
+        rows={FRONT_END_ROWS.map(({ key, label }) => ({
+          label,
+          value: (
+            <span title={fe[key].note}>
+              {fe[key].value}{' '}
+              <span className={`badge-s ${fe[key].source === 'device-reported' ? 'badge-measured' : 'badge-source'}`}>{FRONT_END_SOURCE_LABELS[fe[key].source]}</span>
+            </span>
+          ),
+          muted: fe[key].source === 'unknown',
+        }))}
+      />
+      <p className="note">
+        {state.info ? `Firmware ${fe.firmware}, board ${fe.board}${fe.boardAssumed ? ' (assumed: GET_INFO doesn’t name the board)' : ''}. ` : 'Connect to look up this firmware. '}
+        No DongLoRa firmware reports these yet; the values come from reading its source. Hover a value for where.
+      </p>
+    </Card>
   )
 }
 

@@ -2,7 +2,7 @@ import { useCallback, useState } from 'react'
 import { RADIO_CHIP_NAMES } from '../protocol/codes.ts'
 import { describeConfig } from '../protocol/lora.ts'
 import { isWebSerialSupported } from '../protocol/transports/webserial.ts'
-import { Button } from './parts.tsx'
+import { Button, ErrorBoundary } from './parts.tsx'
 import { LinkErrors, Packets } from './PacketsView.tsx'
 import { RadioView } from './RadioView.tsx'
 import { Shell } from './Shell.tsx'
@@ -98,12 +98,14 @@ export function App() {
               <Button kind="small" onClick={() => store.resetStats()}>reset stats</Button>
             </nav>
             <main className="view">
-              {tab === 'overview' && <Overview state={state} />}
-              {tab === 'radio' && <RadioView state={state} />}
-              {tab === 'packets' && <Packets packets={state.packets} onClear={() => store.clearPackets()} />}
-              {tab === 'link' && <LinkErrors errors={state.linkErrors} counts={st.link} total={st.linkTotal} onClear={() => store.clearLinkErrors()} />}
-              {tab === 'nodes' && <Nodes state={state} />}
-              {tab === 'channel' && <Channel state={state} />}
+              <ErrorBoundary key={tab}>
+                {tab === 'overview' && <Overview state={state} />}
+                {tab === 'radio' && <RadioView state={state} />}
+                {tab === 'packets' && <Packets packets={state.packets} onClear={() => store.clearPackets()} />}
+                {tab === 'link' && <LinkErrors errors={state.linkErrors} counts={st.link} total={st.linkTotal} onClear={() => store.clearLinkErrors()} />}
+                {tab === 'nodes' && <Nodes state={state} />}
+                {tab === 'channel' && <Channel state={state} />}
+              </ErrorBoundary>
             </main>
           </>
         )}
@@ -114,7 +116,9 @@ export function App() {
           <span>Shell</span>
           <span className="muted small">local commands · /help</span>
         </div>
-        <Shell />
+        <ErrorBoundary>
+          <Shell />
+        </ErrorBoundary>
       </div>
     </div>
   )

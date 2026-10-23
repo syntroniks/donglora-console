@@ -3,10 +3,12 @@ import { CAPABILITY_NAMES, MODULATION_NAMES, OWNER_NAMES, RADIO_CHIP_NAMES, SET_
 import { LINK_ERROR_NAMES } from '../protocol/client.ts'
 import { bwKHz, mhz, supportedBws, supportedSfs } from '../protocol/lora.ts'
 import type { DecodeStage } from '../meshcore/decode.ts'
+import { MEDIAN_WINDOW, NOISE_SOURCE_LABELS, NUM_NOISE_FLOOR_SAMPLES } from '../radio/noiseFloor.ts'
+import { NoiseChart } from './NoiseChart.tsx'
 import { configRows } from './configRows.ts'
 import { Card, Empty, Rows } from './parts.tsx'
 import type { RadioState } from './store.ts'
-import { ago, coords, db, dbm, duration, plural, shortKey, time } from './format.ts'
+import { ago, coords, db, dbm, duration, level, plural, shortKey, time } from './format.ts'
 
 /** re-render every second, for "x ago" and uptime */
 function useNow(ms = 1000): number {
@@ -97,12 +99,20 @@ export function Overview({ state }: { state: RadioState }) {
             { label: 'CRC failures', value: <span className={st.crcFail ? 'err' : undefined}>{st.crcFail}{st.rx ? ` (${((st.crcFail / st.rx) * 100).toFixed(0)}%)` : ''}</span> },
             { label: 'Dropped by device', value: <span className={st.dropped ? 'warn' : undefined}>{st.dropped}</span> },
             { label: 'Last packet', value: st.last ? `${dbm(st.last.rssi)} · ${db(st.last.snr)} · ${ago(st.last.at, now)}` : '…', muted: !st.last },
-            { label: 'RSSI avg (range)', value: rssiAvg !== undefined ? `${dbm(rssiAvg)} (${st.rssiMin}…${st.rssiMax})` : '…', muted: rssiAvg === undefined },
-            { label: 'SNR avg (range)', value: snrAvg !== undefined ? `${db(snrAvg)} (${st.snrMin}…${st.snrMax})` : '…', muted: snrAvg === undefined },
+            { label: 'RSSI avg (range)', value: rssiAvg !== undefined ? `${Math.round(rssiAvg)} dBm (${st.rssiMin}…${st.rssiMax})` : '…', muted: rssiAvg === undefined },
+            { label: 'SNR avg (range)', value: snrAvg !== undefined ? `${snrAvg.toFixed(0)} dB (${st.snrMin}…${st.snrMax})` : '…', muted: snrAvg === undefined },
           ]}
         />
         <p className="muted small">Averages and ranges count only packets with a good CRC.</p>
+        {info && info.firmware.major === 1 && info.firmware.minor <= 5 && (
+          <p className="note">
+            DongLoRa {info.firmware.major}.{info.firmware.minor}.{info.firmware.patch} rounds RSSI and SNR to whole dB, always reports
+            a frequency error of 0, and drops packets whose CRC fails before they reach the host (firmware/src/radio.rs), so
+            “CRC fail” only shows up with other firmware or the demo radio.
+          </p>
+        )}
       </Card>
+      <NoiseCard state={state} now={now} />
       <Card title="Decode results">
         <Rows
           rows={[
@@ -168,8 +178,8 @@ export function Nodes({ state }: { state: RadioState }) {
                   <td>{n.name || <span className="muted">(no name)</span>}</td>
                   <td>{n.typeName}</td>
                   <td className="muted" title={`advert timestamp ${new Date(n.advertTimestamp * 1000).toLocaleString()}`}>{ago(n.lastHeard, now)}</td>
-                  <td>{n.rssi.toFixed(1)}</td>
-                  <td>{n.snr.toFixed(1)}</td>
+                  <td>{level(n.rssi)}</td>
+                  <td>{level(n.snr)}</td>
                   <td>{n.hops}</td>
                   <td>{n.lat !== undefined && n.lon !== undefined ? coords(n.lat, n.lon) : <span className="muted">—</span>}</td>
                   <td><code title={n.publicKey}>{shortKey(n.publicKey)}</code></td>
@@ -188,7 +198,10 @@ export function Nodes({ state }: { state: RadioState }) {
 
 export function Channel({ state }: { state: RadioState }) {
   const end = useRef<HTMLDivElement>(null)
-  useEffect(() => end.current?.scrollIntoView({ block: 'end' }), [state.posts.length])
+  // braces matter: Chrome's scrollIntoView now returns a Promise, which React would take as a cleanup
+  useEffect(() => {
+    end.current?.scrollIntoView({ block: 'end' })
+  }, [state.posts.length])
   return (
     <div className="channel">
       <div className="thread-head">
@@ -204,7 +217,7 @@ export function Channel({ state }: { state: RadioState }) {
               <div className="bubble-meta">
                 <span>{new Date(p.timestamp * 1000).toLocaleTimeString([], { hour12: false })}</span>
                 <span>{plural(p.hops, 'hop')}</span>
-                <span>{p.rssi.toFixed(0)} dBm · SNR {p.snr.toFixed(1)}</span>
+                <span>{level(p.rssi)} dBm · SNR {level(p.snr)}</span>
               </div>
             </div>
           ))
@@ -213,6 +226,35 @@ export function Channel({ state }: { state: RadioState }) {
         )}
         <div ref={end} />
       </div>
+    </div>
+  )
+}
+
+function NoiseCard({ state, now }: { state: RadioState; now: number }) {
+  const n = state.noise
+  const badge = <span className={`badge-s ${n.source === 'measured' ? 'badge-measured' : 'badge-source'}`}>{NOISE_SOURCE_LABELS[n.source]}</span>
+  return (
+    <div className="card-span">
+      <Card title="Noise floor" actions={badge}>
+        <Rows
+          rows={[
+            {
+              label: 'Floor (MeshCore)',
+              value: n.floor !== undefined ? `${n.floor} dBm` : `pending: ${n.pending} of ${NUM_NOISE_FLOOR_SAMPLES} samples`,
+              muted: n.floor === undefined,
+            },
+            { label: `Median, last ${MEDIAN_WINDOW}`, value: n.median !== undefined ? `${n.median} dBm (${n.medianCount} sample${n.medianCount === 1 ? '' : 's'})` : '…', muted: n.median === undefined },
+            { label: 'Last update', value: n.last ? `${Math.round(n.last.dbm)} dBm · ${ago(n.last.at, now)}` : 'no samples yet', muted: !n.last },
+            { label: 'Samples', value: `${n.accepted} used, ${n.rejected} over floor + 14 dB` },
+          ]}
+        />
+        <NoiseChart points={state.noiseHistory} />
+        <p className="note">
+          No DongLoRa command reads instantaneous RSSI yet, so each packet’s noise is estimated as RSSI − 10·log10(1 + 10^(SNR/10)),
+          from whole-dB values (±1 dB at best). The floor uses MeshCore’s method: 64 samples under floor + 14 dB, averaged,
+          clamped at −120 dBm. Packets with a failed CRC are left out.
+        </p>
+      </Card>
     </div>
   )
 }

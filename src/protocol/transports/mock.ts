@@ -1,4 +1,4 @@
-// A simulated DongLoRa dongle, for demo mode and tests. It speaks the real wire protocol: COBS frames with
+// A simulated DongLoRa dongle for demo mode and tests. It speaks the real wire protocol: COBS frames with
 // CRCs, the UNCONFIGURED / CONFIGURED state machine with its 1000 ms inactivity timer, the same GET_INFO
 // as a Heltec V4 on firmware 1.5.2, and the same errors. While receiving on the MeshCore USA/Canada
 // settings it hears a small mesh: signed adverts, Public channel posts that decrypt, acks and DMs, and
@@ -113,6 +113,8 @@ export class MockDongLoRaTransport implements Transport {
   readonly received: Frame[] = []
   /** how many times the inactivity timer fired */
   timeouts = 0
+  /** the band's noise floor, wandering slowly between -115 and -105 dBm */
+  noiseFloorDbm = -115 + Math.random() * 10
 
   constructor(options: MockOptions = {}) {
     this.options = options
@@ -279,20 +281,21 @@ export class MockDongLoRaTransport implements Transport {
   /** Emit one RX event of the given kind now. False when the radio isn't receiving. */
   inject(kind: PacketKind): boolean {
     if (!this.receiving) return false
-    const strength = 0.2 + Math.random() * 0.8
+    this.noiseFloorDbm = Math.min(-105, Math.max(-115, this.noiseFloorDbm + (Math.random() - 0.5) * 0.8))
+    const n = this.noiseFloorDbm
+    // most packets 5-30 dB over the floor, some under it (LoRa decodes down to about -7.5 dB at SF7)
+    const snr = kind === 'crc-fail' ? -13 + Math.random() * 6 : Math.random() < 0.12 ? -7 + Math.random() * 6 : 5 + Math.random() * 25
+    // RSSI over the packet is signal plus noise; firmware 1.5.2 rounds both to whole dB
+    const rssi = 10 * Math.log10(10 ** ((n + snr) / 10) + 10 ** (n / 10))
     const rx: RxPacket = {
-      rssi: Math.round(-125 + strength * 60),
-      snr: Math.round((-12 + strength * 22) * 10) / 10,
+      rssi: Math.round(rssi),
+      snr: Math.round(snr),
       freqErr: Math.round((Math.random() - 0.5) * 3000),
       timestampUs: (Date.now() - this.bootAt) * 1000,
       crcValid: kind !== 'crc-fail',
       packetsDropped: Math.random() < 0.04 ? 1 + Math.floor(Math.random() * 3) : 0,
       origin: 0,
       data: this.packet(kind),
-    }
-    if (kind === 'crc-fail') {
-      rx.rssi = -118 - Math.floor(Math.random() * 6)
-      rx.snr = -14 + Math.round(Math.random() * 40) / 10
     }
     this.send(MsgType.Rx, 0, encodeRx(rx))
     return true
@@ -343,10 +346,10 @@ export class MockDongLoRaTransport implements Transport {
       case 'advert-truncated':
         return advert().slice(0, 2 + 60)
       case 'bad-signature': {
-        // the name was changed after signing
-        const p = advert()
-        p[p.length - 1] = p[p.length - 1] === 0x58 ? 0x59 : 0x58
-        return p
+        // the timestamp was changed after signing
+        const p = advertPayload({ ...node, timestamp: now })
+        p[32] ^= 0x01
+        return buildPacket({ payloadType: PayloadType.Advert, path: randPath(3) }, p)
       }
       case 'no-key':
         return groupTextPacket(OTHER_CHANNEL, now, post(), randPath(2))

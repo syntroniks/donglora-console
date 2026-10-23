@@ -305,7 +305,7 @@ export class MockDongLoRaTransport implements Transport {
     }
     return {
       rssiInst,
-      rxGain: RxGain.Boosted,
+      rxGain: RxGain.PowerSaving,
       femType: FemType.Gc1109,
       femFlags: FemFlag.Powered | FemFlag.Lna | FemFlag.Pa,
       rxOk: this.rxOk,

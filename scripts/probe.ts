@@ -2,12 +2,16 @@
 //   pnpm probe [port] [--seconds 60]
 // GET_INFO, SET_CONFIG with the MeshCore USA/Canada preset, RX_START, then every RX event for N seconds
 // (failed ones with their reasons and bytes), then RX_STOP and a summary. It never transmits.
+// When GET_INFO sets capability bit 33 (firmware 1.6.0, protocol v1.1) the keepalive is RADIO_STATUS, and
+// once a second the probe prints its instantaneous RSSI, the measured noise floor, the device's RX
+// counters and the front-end state.
 // The port must be a DongLoRa by USB VID:PID (1209:5741, or a known USB-UART bridge).
 
 import { toHex } from '../src/protocol/bytes.ts'
 import { DongLoRaClient, LINK_ERROR_NAMES, type LinkErrorKind } from '../src/protocol/client.ts'
-import { CAPABILITY_NAMES, RADIO_CHIP_NAMES } from '../src/protocol/codes.ts'
+import { Capability, CAPABILITY_NAMES, FEM_TYPE_NAMES, FemFlag, RADIO_CHIP_NAMES, RX_GAIN_NAMES } from '../src/protocol/codes.ts'
 import { describeConfig, mhz, syncWordHex } from '../src/protocol/lora.ts'
+import { hasCapability, type RadioStatus } from '../src/protocol/messages.ts'
 import { intervalTicker } from '../src/protocol/ticker.ts'
 import { decodeMeshCore, type DecodeStage, type DecodeStatus } from '../src/meshcore/decode.ts'
 import { DEFAULT_PRESET } from '../src/meshcore/presets.ts'
@@ -53,6 +57,42 @@ const posts: string[] = []
 const noise = new NoiseFloorTracker()
 const noiseEstimates: number[] = []
 
+// RADIO_STATUS, from the keepalive (about twice a second) once RX has started
+let statusSupported = false
+let statusTimer: ReturnType<typeof setInterval> | undefined
+let listening = false
+let lastStatus: RadioStatus | undefined
+let firstStatus: RadioStatus | undefined
+let statusReplies = 0
+const rssiInst: number[] = []
+const femText = (s: RadioStatus) => {
+  if (s.femType === 0) return 'no FEM'
+  const on = (bit: number) => (s.femFlags & bit) !== 0
+  return `${FEM_TYPE_NAMES[s.femType] ?? `type 0x${s.femType.toString(16)}`} ${on(FemFlag.Powered) ? 'powered' : 'UNPOWERED'}, LNA ${on(FemFlag.Lna) ? 'on' : 'off'}, ${on(FemFlag.Pa) ? 'PA' : 'PA bypass'}`
+}
+const counters = (s: RadioStatus) => {
+  const b = firstStatus ?? s
+  return `rx_ok ${s.rxOk} (+${s.rxOk - b.rxOk}) crc_err ${s.rxCrcErr} (+${s.rxCrcErr - b.rxCrcErr}) header_err ${s.rxHeaderErr} (+${s.rxHeaderErr - b.rxHeaderErr})`
+}
+client.on('radioStatus', (s) => {
+  if (!listening) return
+  statusReplies++
+  firstStatus ??= s
+  lastStatus = s
+  if (s.rssiInst !== null) {
+    rssiInst.push(s.rssiInst)
+    noise.add({ at: Date.now(), dbm: s.rssiInst, source: 'measured' })
+  }
+})
+client.on('radioStatusUnsupported', (r) => console.log(`${stamp()} ${r}`))
+function printStatus(): void {
+  const s = lastStatus
+  if (!s) return void console.log(`${stamp()} STATUS   no RADIO_STATUS reply yet`)
+  const m = noise.snapshot(Date.now(), 'measured')
+  const floor = m.floor !== undefined ? `${m.floor} dBm` : `pending ${m.pending}/${NUM_NOISE_FLOOR_SAMPLES}`
+  console.log(`${stamp()} STATUS   rssi_inst ${s.rssiInst !== null ? `${s.rssiInst} dBm` : 'none (not in continuous RX)'}  floor ${floor}, median ${m.median ?? '-'} dBm  ${counters(s)}  gain ${RX_GAIN_NAMES[s.rxGain] ?? s.rxGain}  ${femText(s)}`)
+}
+
 client.on('rx', (p) => {
   rx++
   dropped += p.packetsDropped
@@ -90,6 +130,8 @@ let stopping = false
 async function stop(): Promise<void> {
   if (stopping) return
   stopping = true
+  listening = false
+  clearInterval(statusTimer)
   try {
     await client.rxStop()
     console.log(`${stamp()} RX_STOP ok`)
@@ -106,15 +148,25 @@ async function stop(): Promise<void> {
   console.log(`  link errors   ${Object.entries(link).map(([k, v]) => `${LINK_ERROR_NAMES[k as LinkErrorKind]} ${v}`).join(', ') || 'none'}`)
   console.log(`  RSSI dBm      ${range(rssi)}   (CRC-ok packets)`)
   console.log(`  SNR dB        ${range(snr)}`)
-  const nf = noise.snapshot()
+  const nf = noise.snapshot(Date.now(), 'packet-estimate')
   console.log(`  noise (est.)  per packet ${noiseEstimates.length ? noiseEstimates.map((v) => Math.round(v)).join(' ') : '-'} dBm`)
-  console.log(`  noise floor   MeshCore method ${nf.floor !== undefined ? `${nf.floor} dBm` : `pending (${nf.pending}/${NUM_NOISE_FLOOR_SAMPLES} samples)`}, median of last ${MEDIAN_WINDOW} ${nf.median ?? '-'} dBm`)
+  console.log(`  noise floor   from packets: MeshCore method ${nf.floor !== undefined ? `${nf.floor} dBm` : `pending (${nf.pending}/${NUM_NOISE_FLOOR_SAMPLES} samples)`}, median of last ${MEDIAN_WINDOW} ${nf.median ?? '-'} dBm`)
+  if (statusSupported) {
+    const m = noise.snapshot(Date.now(), 'measured')
+    console.log(`  RADIO_STATUS  ${statusReplies} replies while listening, ${statusReplies - rssiInst.length} without RSSI; rssi_inst dBm ${range(rssiInst)}`)
+    console.log(`  noise floor   measured: MeshCore method ${m.floor !== undefined ? `${m.floor} dBm` : `pending (${m.pending}/${NUM_NOISE_FLOOR_SAMPLES} samples)`}, median of last ${MEDIAN_WINDOW} ${m.median ?? '-'} dBm, ${m.accepted} used, ${m.rejected} over floor + 14 dB`)
+    if (lastStatus) {
+      console.log(`  counters      since boot (+while listening): ${counters(lastStatus)}`)
+      console.log(`                the probe saw ${rx - crcFail} CRC ok and ${crcFail} CRC fail RX events; header errors never reach the host`)
+      console.log(`  front end     RX gain ${RX_GAIN_NAMES[lastStatus.rxGain] ?? lastStatus.rxGain}; ${femText(lastStatus)}`)
+    }
+  } else console.log('  RADIO_STATUS  not supported by this firmware (no capability bit 33)')
   console.log(`  nodes         ${nodes.size ? '' : 'none'}`)
   for (const n of nodes.values()) console.log(`    ${n}`)
   console.log(`  Public posts  ${posts.length ? '' : 'none'}`)
   for (const p of posts) console.log(`    ${p}`)
   const h = client.health
-  console.log(`  keepalive     ${h.pings} PINGs, ${h.failures} failed, avg rtt ${h.avgRttMs?.toFixed(1) ?? '-'} ms, longest gap ${h.maxGapMs} ms, sessions lost ${h.lostSessions}`)
+  console.log(`  keepalive     ${h.pings} ${h.command} ok, ${h.failures} failed, avg rtt ${h.avgRttMs?.toFixed(1) ?? '-'} ms, longest gap ${h.maxGapMs} ms, sessions lost ${h.lostSessions}`)
   process.exit(0)
 }
 process.on('SIGINT', () => void stop())
@@ -124,6 +176,7 @@ console.log("don't connect a browser tab to the dongle while this runs: Chrome c
 await client.connect()
 const info = await client.getInfo()
 const caps = Object.entries(CAPABILITY_NAMES).filter(([b]) => ((info.capabilities >> BigInt(b)) & 1n) === 1n).map(([, n]) => n)
+statusSupported = hasCapability(info, Capability.RadioStatus)
 console.log(`GET_INFO: DongLoRa ${info.firmware.major}.${info.firmware.minor}.${info.firmware.patch}, protocol ${info.protocol.major}.${info.protocol.minor}, ${RADIO_CHIP_NAMES[info.radioChipId]}`)
 console.log(`  ${mhz(info.freqMinHz)}–${mhz(info.freqMaxHz)} MHz, ${info.txPowerMinDbm}…${info.txPowerMaxDbm} dBm, SF bitmap 0x${info.sfBitmap.toString(16)}, BW bitmap 0x${info.bwBitmap.toString(16)}`)
 console.log(`  caps ${caps.join(', ')} (0x${info.capabilities.toString(16)}), max payload ${info.maxPayloadBytes}, RX queue ${info.rxQueueCapacity}, TX queue ${info.txQueueCapacity}, MCU UID ${info.mcuUid}`)
@@ -134,5 +187,7 @@ console.log(e ? `  echo: ${describeConfig(e)}, preamble ${e.preambleLen}, sync $
 const same = e && JSON.stringify(e) === JSON.stringify(DEFAULT_PRESET.config)
 console.log(`  ${same ? 'matches the request' : 'DIFFERS from the request'}`)
 await client.rxStart()
-console.log(`RX_START ok, listening ${seconds} s (Ctrl-C to stop early)\n`)
+listening = true
+console.log(`RX_START ok, listening ${seconds} s (Ctrl-C to stop early)${statusSupported ? '; RADIO_STATUS is the keepalive, printed once a second' : ''}\n`)
+if (statusSupported) statusTimer = setInterval(printStatus, 1000)
 setTimeout(() => void stop(), seconds * 1000)

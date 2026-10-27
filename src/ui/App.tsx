@@ -6,7 +6,7 @@ import { Button, ErrorBoundary } from './parts.tsx'
 import { LinkErrors, Packets } from './PacketsView.tsx'
 import { RadioView } from './RadioView.tsx'
 import { Shell } from './Shell.tsx'
-import { store } from './store.ts'
+import { defaultServerUrl, store } from './store.ts'
 import { useRadio } from './useRadio.ts'
 import { Channel, Nodes, Overview } from './views.tsx'
 
@@ -69,6 +69,9 @@ export function App() {
             <Button kind="primary" onClick={() => report(store.connectSerial())} disabled={!webSerial} title={webSerial ? 'Pick the DongLoRa’s USB serial port' : 'WebSerial needs Chrome or Edge on desktop'}>
               Connect USB
             </Button>
+            <Button onClick={() => report(store.connectServer(defaultServerUrl()))} title={`Through the console server at ${defaultServerUrl()} (pnpm server)`}>
+              Connect server
+            </Button>
             <Button onClick={() => report(store.connectDemo())}>Demo radio</Button>
           </>
         ) : (
@@ -125,6 +128,7 @@ export function App() {
 }
 
 function Welcome({ webSerial }: { webSerial: boolean }) {
+  const [serverUrl, setServerUrl] = useState(defaultServerUrl)
   return (
     <div className="welcome">
       <h1>Connect a DongLoRa dongle</h1>
@@ -142,6 +146,17 @@ function Welcome({ webSerial }: { webSerial: boolean }) {
         Only one program can hold the serial port: close other tabs, <code>pnpm probe</code> and flashing tools first.
         The demo radio is simulated in this page, including broken packets and link errors of every kind.
       </p>
+      <h2>Or through a console server</h2>
+      <p className="muted small">
+        <code>pnpm server</code> shares the dongle through donglora-mux, so this page, scripts and its JSON API at{' '}
+        <code>/api</code> can all use it at once, and the dongle can be on another machine.
+      </p>
+      <div className="welcome-server">
+        <input className="server-url" type="text" value={serverUrl} onChange={(e) => setServerUrl(e.target.value)} spellCheck={false} aria-label="console server WebSocket URL" />
+        <Button onClick={() => report(store.connectServer(serverUrl.trim()))} disabled={!/^wss?:\/\/./.test(serverUrl.trim())}>
+          Connect server
+        </Button>
+      </div>
     </div>
   )
 }

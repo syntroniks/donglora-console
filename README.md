@@ -8,6 +8,9 @@ It talks DongLoRa Protocol v1.0 over WebSerial, plus the v1.1 additions when the
 Edge on desktop. It was built against a Heltec V4 (ESP32-S3 + SX1262) on DongLoRa firmware 1.5.2 and 1.6.0, and defaults
 to the MeshCore USA/Canada settings.
 
+It can also reach the dongle through the [console server](#console-server), which shares it via donglora-mux with
+scripts and a JSON API, and lets the dongle sit on another machine.
+
 ## Running it
 
 ```sh
@@ -26,6 +29,7 @@ reads GET_INFO, sends SET_CONFIG with the requested config (MeshCore USA/Canada 
 | `pnpm test` | unit tests (Vitest, about a second) |
 | `pnpm typecheck` / `pnpm lint` | TypeScript 7 / oxlint |
 | `pnpm probe [port] [--seconds 60]` | receive-only check against a real dongle from Node |
+| `pnpm server [--demo]` | the [console server](#console-server): JSON API, `/ws` relay, built console |
 
 `pnpm probe` finds the dongle by USB VID:PID and refuses to open a port that isn't one. It runs GET_INFO, SET_CONFIG
 with the USA/Canada preset and RX_START, prints every RX event for the given time (failed ones with their stage,
@@ -35,6 +39,89 @@ summary. It never transmits. Disconnect the browser first, and don't connect
 it while the probe runs. The probe's lock doesn't stop Chrome from opening the same tty. When both have it open, replies
 split between them, and Chrome's `PARMRK` setting makes the other reader see every 0xFF byte doubled, which shows up
 as COBS link errors.
+
+## Console server
+
+WebSerial gives one tab the serial port to itself, so nothing else can read the radio while the console is connected.
+The console server (`server/`) puts [donglora-mux](https://github.com/donglora/mux-rs) in front of the dongle and is
+itself a mux client:
+
+```
+dongle ── USB ── donglora-mux ──┬── console server ──┬── /api   JSON API and events, from its own session
+                                │   (pnpm server)    ├── /ws    one mux session per console page
+                                │                    └── /      the built console
+                                └── client-py, client-rs, other mux clients
+```
+
+mux owns the port. It gives every client its own tags, keeps RX on while any client wants it and locks the config to
+the first client that sets it; other clients get `ALREADY_MATCHED` or `LOCKED_MISMATCH` back. The server's session
+asks for its `--preset` on connect, so it normally holds that lock, and `PUT /api/config` changes the config for
+everyone. Upstream mux 1.0.2 answers RADIO_STATUS with `EUNKNOWN_CMD` because its protocol crate predates it; the
+console then keeps the session alive with PING. Built against `protocol-rs` 1.3 (`[patch.crates-io]` to the sibling
+checkout) it forwards RADIO_STATUS like any other command.
+
+```sh
+donglora-mux --tcp none     # owns the dongle; Unix socket only (its default TCP listener is 0.0.0.0:5741)
+pnpm server                 # http://127.0.0.1:5742; finds mux's socket like client-rs does
+pnpm server --demo          # a simulated firmware 1.6.0 dongle instead, no hardware or mux needed
+```
+
+Open http://127.0.0.1:5742 (after `pnpm build`) or the `pnpm dev` page and click **Connect server**. The dev and
+preview servers proxy `/api` and `/ws` to 5742, so the page reaches the server on its own origin. The URL is editable
+on the welcome screen and remembered; on `*.github.io` it defaults to `ws://localhost:5742/ws`.
+
+| Option | |
+| --- | --- |
+| `--mux <path\|host:port>` | mux socket; default `$DONGLORA_MUX`, then `$XDG_RUNTIME_DIR/donglora/mux.sock`, then `/tmp/donglora-mux.sock` |
+| `--demo` | simulated dongle, one per connection |
+| `--port <n>` / `--host <addr>` | listen address, default `127.0.0.1:5742` |
+| `--allow-origin <url>` | another web origin allowed to use the API and `/ws` (repeatable) |
+| `--allow-tx` | let `/api/tx` and `/ws` clients transmit |
+| `--preset <id>` | config the server's session asks for, default `meshcore-us` |
+
+### API
+
+JSON in and out. Bytes are lowercase hex, the 64-bit capability bitmap is a `0x` string, times are `Date.now()`
+milliseconds. Errors are `{"error": "..."}` with 400 for bad input, 403 for refused, 502 when the dongle or mux
+answered ERR, 503 when the server has no dongle session and 504 on a timeout.
+
+| Endpoint | |
+| --- | --- |
+| `GET /api` | the endpoint list |
+| `GET /api/server` | version, upstream, whether TX is allowed, open `/ws` relays |
+| `GET /api/state` | connection, GET_INFO, requested and applied config, RX on/off, stats, keepalive health, noise floor, counts |
+| `GET /api/info` | GET_INFO |
+| `GET /api/config` / `PUT /api/config` | requested and applied config; PUT takes `{"preset": "meshcore-eu"}` or LoRa fields (`freqHz`, `sf`, `bw`, `cr` as wire enums, `txPowerDbm`, ...) laid over the requested config, and restarts RX if it was on |
+| `GET /api/presets` | the MeshCore presets |
+| `POST /api/rx/start` / `POST /api/rx/stop` | RX for the server's session |
+| `GET /api/packets?limit=50&after=<id>` | received packets with their MeshCore decode, newest first |
+| `GET /api/nodes` | nodes from signed adverts, most recently heard first |
+| `GET /api/channel?limit=100` | Public channel messages, newest first |
+| `GET /api/radio` | last RADIO_STATUS, counters at the start of the session, noise floor, keepalive health |
+| `GET /api/link-errors?limit=100` / `GET /api/log` | link errors and the session log, newest first |
+| `POST /api/tx` | `{"hex": "..."}`, only with `--allow-tx`; answers TX_DONE |
+| `GET /api/events` | server-sent events: `state` on connect and at most once a second after, `packet`, `link-error`, `log`, `tx-done` |
+
+```sh
+curl -s localhost:5742/api/nodes
+curl -s -X PUT -H 'content-type: application/json' -d '{"preset":"meshcore-us"}' localhost:5742/api/config
+curl -sN localhost:5742/api/events
+```
+
+`/ws` carries the DongLoRa byte stream in binary messages, so any DongLoRa client works over it: the console uses
+`WebSocketTransport` (`src/protocol/transports/websocket.ts`) with its usual client. The relay decodes each frame and
+re-encodes it on the way to mux. Without `--allow-tx` it answers TX with `ERR(EUNKNOWN_CMD)` itself, as mux does for a
+command it won't forward, and the console refuses to arm TX on such a server.
+
+### Who can reach it
+
+It listens on loopback. It refuses a request whose `Host` isn't a loopback name, which stops DNS rebinding, and a
+browser request (or WebSocket upgrade) whose `Origin` isn't the server itself, `https://syntroniks.github.io` or an
+`--allow-origin`. That keeps a page you happen to visit from driving the radio; requests without an Origin, such as
+curl, are allowed. A page on `https://` can reach `http://localhost` and `ws://localhost`, after Chrome's local
+network prompt; the server answers the Private Network Access preflight. Any other host needs TLS (`wss://`) in
+front, and with `--host` set to a non-loopback address anyone who reaches the port can use the radio, so put
+authentication in front as well.
 
 ## Safety
 
@@ -50,6 +137,7 @@ as COBS link errors.
   powered FEM the value is approximate antenna output, and GET_INFO's TX range is the output range (2…28 dBm on the
   GC1109, 4…28 on the KCT8103L). Config validation uses whatever range GET_INFO reports. The Radio tab says which case
   applies.
+- The console server refuses TX, on `/api/tx` and `/ws`, unless it was started with `--allow-tx`.
 - The demo radio and the unit tests are the only things that have exercised TX.
 
 ## Errors are shown, not dropped
@@ -155,8 +243,9 @@ client probe with an RX command. That is a no-op on a live session, and on a res
 On ENOTCONFIGURED the client re-sends the last config and restarts RX if it was on. A TX is never retried. Overview
 shows keepalive round trips, which command the keepalive uses, the longest write gap and sessions lost and restored.
 
-The connection lives outside React (`src/ui/store.ts`), so StrictMode and Fast Refresh can't open a second port. There
-is one store per page, kept on `globalThis`. When Vite re-runs the module, the live instance keeps its client, port and
+The connection lives outside React, so StrictMode and Fast Refresh can't open a second port. The session state is a
+`RadioStore` (`src/radio/store.ts`) that doesn't know its transport; the console server runs the same class. The page
+has one, with its WebSerial, demo and server connections (`src/ui/store.ts`), kept on `globalThis`. When Vite re-runs the module, the live instance keeps its client, port and
 subscribers and takes the new code; Vite doesn't call `dispose` on intermediate modules, so a handover would get lost.
 A crash in one view is caught by an error boundary instead of unmounting the app. The WebSerial transport serialises writes,
 catches recoverable read errors inside its loop, waits for the read loop before closing the port, raises DTR explicitly
@@ -172,11 +261,12 @@ src/protocol/        DongLoRa Protocol, no UI dependencies
   lora.ts            bandwidth/CR tables, validation against GET_INFO, airtime
   client.ts          tags, timeouts, write queue, keepalive, recovery, link errors
   ticker.ts          Worker-backed interval for the keepalive
-  transports/        WebSerial, and the simulated dongle for demo mode and tests
+  transports/        WebSerial, WebSocket (console server), and the simulated dongle for demo mode and tests
 src/meshcore/        MeshCore over-the-air packets: decode (with failure stages), crypto, builders, presets
-src/radio/           noise floor (measured and estimated), receiver front end, what TX power means
+src/radio/           the session store, noise floor (measured and estimated), receiver front end, what TX power means
 src/console/         shell line editing and command catalog
-src/ui/              React views, the connection store, the xterm shell
+src/ui/              React views, the page's store and its connections, the xterm shell
+server/              console server: mux and demo upstreams, JSON API and events, /ws relay, its tests
 scripts/             Node tools (node-serialport transport, probe)
 test/                Vitest; appendixC.ts holds the wire examples from PROTOCOL.md Appendix C
 ```

@@ -1,8 +1,9 @@
 # DongLoRa Console
 
 A browser console for a [DongLoRa](https://github.com/donglora) USB LoRa dongle: device info and the config the radio
-actually applied, live RX with MeshCore decoding, the nodes heard from their adverts, a read-only feed of the MeshCore
-Public channel, link and decode errors with their bytes, and a shell.
+actually applied, live RX decoded by protocol [plugins](#plugins) (MeshCore and Meshtastic), the nodes they learn about,
+the channel messages they can read, link and decode errors with their bytes, a shell, and [scripts](#scripts) of your
+own that react to traffic and drive the radio.
 
 It talks DongLoRa Protocol v1.0 over WebSerial, plus the v1.1 additions when the firmware has them, so it needs Chrome or
 Edge on desktop. It was built against a Heltec V4 (ESP32-S3 + SX1262) on DongLoRa firmware 1.5.2 and 1.6.0, and defaults
@@ -77,7 +78,8 @@ on the welcome screen and remembered; on `*.github.io` it defaults to `ws://loca
 | `--port <n>` / `--host <addr>` | listen address, default `127.0.0.1:5742` |
 | `--allow-origin <url>` | another web origin allowed to use the API and `/ws` (repeatable) |
 | `--allow-tx` | let `/api/tx` and `/ws` clients transmit |
-| `--preset <id>` | config the server's session asks for, default `meshcore-us` |
+| `--preset <id>` | config the server's session asks for, default `meshcore-us`; any plugin preset |
+| `--script <file.js>` | run a [script](#scripts) against the server's session (repeatable) |
 
 ### API
 
@@ -92,15 +94,17 @@ answered ERR, 503 when the server has no dongle session and 504 on a timeout.
 | `GET /api/state` | connection, GET_INFO, requested and applied config, RX on/off, stats, keepalive health, noise floor, counts |
 | `GET /api/info` | GET_INFO |
 | `GET /api/config` / `PUT /api/config` | requested and applied config; PUT takes `{"preset": "meshcore-eu"}` or LoRa fields (`freqHz`, `sf`, `bw`, `cr` as wire enums, `txPowerDbm`, ...) laid over the requested config, and restarts RX if it was on |
-| `GET /api/presets` | the MeshCore presets |
+| `GET /api/plugins` | protocol plugins with their presets, and which one decodes the current config |
+| `GET /api/presets` | every plugin preset |
 | `POST /api/rx/start` / `POST /api/rx/stop` | RX for the server's session |
-| `GET /api/packets?limit=50&after=<id>` | received packets with their MeshCore decode, newest first |
-| `GET /api/nodes` | nodes from signed adverts, most recently heard first |
-| `GET /api/channel?limit=100` | Public channel messages, newest first |
+| `GET /api/packets?limit=50&after=<id>&protocol=<id>` | received packets with their plugin decode, newest first |
+| `GET /api/nodes?protocol=<id>` | nodes the plugins learned about, most recently heard first |
+| `GET /api/messages?limit=100&protocol=<id>` | channel messages, newest first |
+| `GET /api/scripts` | scripts started with `--script`, running or not, with their recent output |
 | `GET /api/radio` | last RADIO_STATUS, counters at the start of the session, noise floor, keepalive health |
 | `GET /api/link-errors?limit=100` / `GET /api/log` | link errors and the session log, newest first |
 | `POST /api/tx` | `{"hex": "..."}`, only with `--allow-tx`; answers TX_DONE |
-| `GET /api/events` | server-sent events: `state` on connect and at most once a second after, `packet`, `link-error`, `log`, `tx-done` |
+| `GET /api/events` | server-sent events: `state` on connect and at most once a second after, `packet`, `node`, `message`, `link-error`, `log`, `tx-done` |
 
 ```sh
 curl -s localhost:5742/api/nodes
@@ -123,6 +127,51 @@ network prompt; the server answers the Private Network Access preflight. Any oth
 front, and with `--host` set to a non-loopback address anyone who reaches the port can use the radio, so put
 authentication in front as well.
 
+## Plugins
+
+Each LoRa protocol is a plugin (`src/plugins/`) with no UI of its own: presets (the PHY), a decoder that turns bytes
+into a status, a summary, labelled fields and tinted byte ranges, and a `learn` step that says what a packet with a good
+CRC tells about nodes and messages. The views, the shell, the server API and scripts are generic over that, so a
+plugin shows up everywhere at once.
+
+| Plugin | Claims packets when | Decodes | Learns |
+| --- | --- | --- | --- |
+| MeshCore | sync word 0x12 (0x1424) | header, path, adverts (Ed25519 checked), Public channel, addressed traffic | nodes from adverts with a valid signature; Public channel posts |
+| Meshtastic | sync word 0x2B (0x24B4) | 16-byte header, AES-CTR with the default channel keys, `Data` protobuf: text, position, node info, telemetry, routing, traceroute | nodes from any packet it decrypts (Meshtastic broadcasts aren't signed); text messages |
+
+A radio hears one protocol at a time: frequency, SF, bandwidth and sync word all have to match, so the preset you pick on
+the Radio tab (grouped by plugin) decides which plugin decodes. A packet received with a config no plugin claims is
+kept as raw bytes, labelled "no plugin". To hear two protocols, alternate presets (the *Protocol hopper* example
+script) or use one dongle per protocol. The Meshtastic plugin was written from the protocol's documentation and tested
+against packets it built itself; it hasn't decoded real traffic yet.
+
+A new plugin implements `ProtocolPlugin` in `src/plugins/types.ts` and goes in the `PLUGINS` list in
+`src/plugins/index.ts`.
+
+## Scripts
+
+Scripts are your own JavaScript. On the Scripts tab you write them, start them from examples, run and stop them, and
+see their output, which also goes to the shell (`/scripts`, `/run <name>`, `/stop <name>|all`). They are kept in this
+browser; tick *run when connected* to start one on every connect.
+
+```js
+on('node', (n) => n.isNew && print(`new ${n.protocol} node ${n.name || n.id} at ${n.rssi} dBm`))
+every(10_000, async () => print('RSSI', (await radio.status())?.rssiInst))
+await radio.setConfig('meshtastic-longfast-us')
+```
+
+The script body runs as an async function in its own Web Worker. It can't touch the page or the radio session
+directly, only through `radio.state() info() config() setConfig(presetIdOrFields) rxStart() rxStop() ping() status()
+packets(n) nodes() messages(n) plugins() tx(hexOrBytes)`, `on(event, fn)` for `packet`, `node`, `message`,
+`link-error`, `log`, `connected` and `disconnected`, `every(ms, fn)`, `sleep(ms)`, `print()`, `warn()`, and
+`storage.get/set` (JSON values, per script). An error in a handler or timer is printed and the script keeps going; an
+error at the top level ends it.
+
+`radio.tx()` works only for a script started with *may transmit* ticked, which asks first, and only while TX is armed
+on the Radio tab; every send is logged. The console server runs scripts with `--script`, each in a worker thread
+against the server's session, starting when it first connects; there `tx()` needs `--allow-tx`. A worker thread can use
+Node's APIs, so only give the server scripts you trust. The server never accepts scripts over HTTP.
+
 ## Safety
 
 - **Nothing transmits unless you arm TX.** The Radio tab has an *Enable TX* toggle, off by default and on every new
@@ -137,7 +186,8 @@ authentication in front as well.
   powered FEM the value is approximate antenna output, and GET_INFO's TX range is the output range (2…28 dBm on the
   GC1109, 4…28 on the KCT8103L). Config validation uses whatever range GET_INFO reports. The Radio tab says which case
   applies.
-- The console server refuses TX, on `/api/tx` and `/ws`, unless it was started with `--allow-tx`.
+- The console server refuses TX, on `/api/tx`, `/ws` and from scripts, unless it was started with `--allow-tx`.
+- A script transmits only if you ticked *may transmit* for it (the console asks), and only while TX is armed.
 - The demo radio and the unit tests are the only things that have exercised TX.
 
 ## Errors are shown, not dropped
@@ -227,9 +277,9 @@ count, no bytes)*. `/stats` prints the counters.
 ## Shell
 
 Commands are local; DongLoRa has no CLI. `/help`, `/info` (GET_INFO), `/ping`, `/config` (requested and echoed),
-`/preset us|eu|au|nz`, `/rx on|off` (print packets), `/rx start|stop` (RX_START / RX_STOP), `/frames on|all|off` (hex of
+`/preset <id>` (any plugin preset, or a unique suffix like `us`), `/plugins`, `/rx on|off` (print packets), `/rx start|stop` (RX_START / RX_STOP), `/frames on|all|off` (hex of
 every frame, `all` includes the keepalive PINGs or RADIO_STATUS), `/stats`, `/noise`, `/agc`, `/errors`, `/nodes`,
-`/clear` and `/tx <hex>` (needs TX armed, asks to confirm). Tab completes, arrows walk history, Ctrl-C stops waiting
+`/scripts`, `/run <script>`, `/stop <script>|all`, `/clear` and `/tx <hex>` (needs TX armed, asks to confirm). Tab completes, arrows walk history, Ctrl-C stops waiting
 for a command.
 
 ## Session handling
@@ -262,11 +312,13 @@ src/protocol/        DongLoRa Protocol, no UI dependencies
   client.ts          tags, timeouts, write queue, keepalive, recovery, link errors
   ticker.ts          Worker-backed interval for the keepalive
   transports/        WebSerial, WebSocket (console server), and the simulated dongle for demo mode and tests
+src/plugins/         protocol plugin interface, the registry (presets, which plugin decodes), MeshCore and Meshtastic
 src/meshcore/        MeshCore over-the-air packets: decode (with failure stages), crypto, builders, presets
-src/radio/           the session store, noise floor (measured and estimated), receiver front end, what TX power means
+src/scripts/         script runtime: the sandbox that runs in a worker, the host that answers it, examples
+src/radio/           the session store, its summary, noise floor (measured and estimated), receiver front end, TX power
 src/console/         shell line editing and command catalog
-src/ui/              React views, the page's store and its connections, the xterm shell
-server/              console server: mux and demo upstreams, JSON API and events, /ws relay, its tests
+src/ui/              React views, the page's radio and script stores, the xterm shell
+server/              console server: mux and demo upstreams, JSON API and events, /ws relay, scripts, its tests
 scripts/             Node tools (node-serialport transport, probe)
 test/                Vitest; appendixC.ts holds the wire examples from PROTOCOL.md Appendix C
 ```

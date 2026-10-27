@@ -11,6 +11,7 @@ import { advertPayload, buildPacket, groupTextPacket, groupTextPayload, publicKe
 import { PayloadType } from '../../meshcore/codes.ts'
 import { makeChannel, PUBLIC_CHANNEL } from '../../meshcore/crypto.ts'
 import { MESHCORE_SYNC_WORD } from '../../meshcore/presets.ts'
+import { BROADCAST, encodeMeshtasticPacket, encodePosition, encodeTelemetry, encodeText, encodeUser, makeChannel as meshtasticChannel, MESHTASTIC_SYNC_WORD, nodeId, PortNum } from '../../plugins/meshtastic/index.ts'
 import { ByteWriter } from '../bytes.ts'
 import type { Transport, TransportSink } from '../client.ts'
 import { cobsEncode } from '../cobs.ts'
@@ -115,6 +116,15 @@ const POSTERS = ['KJ5GFX Bill', 'Driftwood', 'Maya', 'Tom 🚲', 'Alex']
 const CHATTER = ['anyone on 910.525 tonight?', 'testing from the hilltop', 'good copy, thanks', 'repeater looks healthy', 'heading out on the trail, will check in later', 'hearing you 2 hops out']
 /** a hashtag channel this console has no key for */
 const OTHER_CHANNEL = makeChannel('#austin', 'd1c4a3b2f0e9d8c7b6a5948372615041')
+
+/** a simulated Meshtastic mesh on LongFast, US default slot, with the default key */
+const LONGFAST = meshtasticChannel('LongFast')
+const MT_NODES = [
+  { num: 0x3a1f9c02, longName: 'Hilltop Base', shortName: 'HTB', role: 2, hwModel: 9, lat: 30.2861, lon: -97.7362 },
+  { num: 0x9be41d77, longName: "Sam's T-Echo", shortName: 'SAM', role: 0, hwModel: 7, lat: 30.2738, lon: -97.7581 },
+  { num: 0x51c0ffee, longName: 'Weather Stn', shortName: 'WX', role: 6, hwModel: 43, lat: 30.2511, lon: -97.7012 },
+]
+const MT_CHATTER = ['anyone on LongFast?', 'QSL from the east side', 'battery holding up fine', 'testing range from the car']
 
 const pick = <T>(xs: readonly T[]): T => xs[Math.floor(Math.random() * xs.length)]
 const randBytes = (n: number) => Uint8Array.from({ length: n }, () => Math.floor(Math.random() * 256))
@@ -320,6 +330,12 @@ export class MockDongLoRaTransport implements Transport {
     this.noiseFloorDbm = Math.min(-110, Math.max(-114, this.noiseFloorDbm + (Math.random() - 0.5) * step))
   }
 
+  /** whether the radio is tuned to the simulated Meshtastic mesh (LongFast, US) */
+  private onMeshtastic(): boolean {
+    const c = this.config
+    return !!c && c.freqHz === 906_875_000 && c.sf === 11 && c.bw === 8 && c.syncWord === MESHTASTIC_SYNC_WORD && !c.iqInvert && !c.implicitHeader
+  }
+
   /** whether the radio is tuned to the simulated mesh */
   private onMesh(): boolean {
     const c = this.config
@@ -328,6 +344,10 @@ export class MockDongLoRaTransport implements Transport {
 
   private hear(): void {
     if (!this.receiving) return
+    if (this.onMeshtastic()) {
+      this.emitRx(this.meshtasticPacket(), true)
+      return
+    }
     if (!this.onMesh()) {
       // off the mesh's settings: only the odd burst of noise
       if (Math.random() < 0.15) this.inject('crc-fail')
@@ -343,10 +363,14 @@ export class MockDongLoRaTransport implements Transport {
   /** Emit one RX event of the given kind now. False when the radio isn't receiving. */
   inject(kind: PacketKind): boolean {
     if (!this.receiving) return false
+    return this.emitRx(this.packet(kind), kind !== 'crc-fail')
+  }
+
+  private emitRx(data: Uint8Array, crcValid: boolean): boolean {
     this.drift(0.8)
     const n = this.noiseFloorDbm
     // most packets 5-30 dB over the floor, some under it (LoRa decodes down to about -7.5 dB at SF7)
-    const snr = kind === 'crc-fail' ? -13 + Math.random() * 6 : Math.random() < 0.12 ? -7 + Math.random() * 6 : 5 + Math.random() * 25
+    const snr = !crcValid ? -13 + Math.random() * 6 : Math.random() < 0.12 ? -7 + Math.random() * 6 : 5 + Math.random() * 25
     // RSSI over the packet is signal plus noise; the firmware rounds both to whole dB
     const rssi = 10 * Math.log10(10 ** ((n + snr) / 10) + 10 ** (n / 10))
     const rx: RxPacket = {
@@ -354,15 +378,30 @@ export class MockDongLoRaTransport implements Transport {
       snr: Math.round(snr),
       freqErr: Math.round((Math.random() - 0.5) * 3000),
       timestampUs: (Date.now() - this.bootAt) * 1000,
-      crcValid: kind !== 'crc-fail',
+      crcValid,
       packetsDropped: Math.random() < 0.04 ? 1 + Math.floor(Math.random() * 3) : 0,
       origin: 0,
-      data: this.packet(kind),
+      data,
     }
     if (rx.crcValid) this.rxOk++
     else this.rxCrcErr++
     this.send(MsgType.Rx, 0, encodeRx(rx))
     return true
+  }
+
+  /** node info, a position, device telemetry or a text post from one of the simulated Meshtastic nodes */
+  private meshtasticPacket(): Uint8Array {
+    const node = pick(MT_NODES)
+    const hopStart = 3
+    const base = { to: BROADCAST, from: node.num, id: Math.floor(Math.random() * 0xffffffff), hopStart, hopLimit: hopStart - Math.floor(Math.random() * 3), channel: LONGFAST.hash, key: LONGFAST.key }
+    const r = Math.random()
+    if (r < 0.25) return encodeMeshtasticPacket({ ...base, portnum: PortNum.NodeInfo, payload: encodeUser({ id: nodeId(node.num), longName: node.longName, shortName: node.shortName, hwModel: node.hwModel, role: node.role }) })
+    if (r < 0.5) return encodeMeshtasticPacket({ ...base, portnum: PortNum.Position, payload: encodePosition({ lat: node.lat, lon: node.lon, time: Math.floor(Date.now() / 1000) }) })
+    if (r < 0.75) {
+      const device = { batteryLevel: 40 + Math.floor(Math.random() * 60), voltage: 3.7 + Math.random() * 0.4, channelUtilization: Math.random() * 20, airUtilTx: Math.random() * 3, uptimeSeconds: Math.floor((Date.now() - this.bootAt) / 1000) + 86_400 }
+      return encodeMeshtasticPacket({ ...base, portnum: PortNum.Telemetry, payload: encodeTelemetry({ time: Math.floor(Date.now() / 1000), device }) })
+    }
+    return encodeMeshtasticPacket({ ...base, portnum: PortNum.Text, payload: encodeText(pick(MT_CHATTER)) })
   }
 
   private packet(kind: PacketKind): Uint8Array {

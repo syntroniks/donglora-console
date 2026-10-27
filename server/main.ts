@@ -9,7 +9,7 @@
 // isn't this server, the hosted console or an --allow-origin, so a web page you happen to visit can't
 // drive the radio. Requests with no Origin (curl, scripts) are allowed. TX is refused unless --allow-tx.
 
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { readFile, stat } from 'node:fs/promises'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import type { Duplex } from 'node:stream'
@@ -17,11 +17,12 @@ import { extname, join, normalize, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 import { WebSocketServer } from 'ws'
-import { DEFAULT_PRESET, presetById, PRESETS } from '../src/meshcore/presets.ts'
+import { DEFAULT_PRESET, presetById, PRESETS } from '../src/plugins/index.ts'
 import { describeConfig } from '../src/protocol/lora.ts'
 import { RadioStore } from '../src/radio/store.ts'
 import { handleApi, type ServerFacts } from './api.ts'
 import { relay } from './relay.ts'
+import { startServerScripts } from './scripts.ts'
 import { defaultMuxSocket, demoUpstream, muxUpstream, parseMuxTarget, type Upstream } from './upstream.ts'
 
 const HELP = `usage: pnpm server [options]
@@ -39,6 +40,9 @@ byte stream on /ws for the console's "Connect server", and the built console on 
   --allow-tx              let /api/tx and /ws clients transmit (refused otherwise)
   --preset <id>           config the server's session asks for (default ${DEFAULT_PRESET.id}):
                           ${PRESETS.map((p) => p.id).join(', ')}
+  --script <file.js>      run a script against the server's session (repeatable); it runs
+                          in a worker thread with Node's APIs, so only run scripts you trust,
+                          and it may transmit only with --allow-tx
   -h, --help              this text
 `
 
@@ -68,6 +72,7 @@ function options() {
         'allow-origin': { type: 'string', multiple: true, default: [] },
         'allow-tx': { type: 'boolean', default: false },
         preset: { type: 'string', default: DEFAULT_PRESET.id },
+        script: { type: 'string', multiple: true, default: [] },
         help: { type: 'boolean', short: 'h', default: false },
       },
     }).values
@@ -84,6 +89,7 @@ function options() {
   if (!preset) fail(`unknown --preset ${parsed.preset}`)
   if (parsed.demo && parsed.mux) fail('--demo and --mux are exclusive')
   for (const o of parsed['allow-origin']) if (!/^https?:\/\/[^/]+$/.test(o)) fail(`--allow-origin ${o} isn't an origin like https://example.com`)
+  for (const f of parsed.script) if (!existsSync(f)) fail(`--script ${f}: no such file`)
   const upstream: Upstream = parsed.demo ? demoUpstream() : muxUpstream(parseMuxTarget(parsed.mux ?? defaultMuxSocket()))
   return {
     port,
@@ -92,6 +98,7 @@ function options() {
     allowTx: parsed['allow-tx'],
     origins: new Set([...DEFAULT_ORIGINS, ...parsed['allow-origin']]),
     preset,
+    scripts: parsed.script,
   }
 }
 
@@ -138,6 +145,7 @@ function refuse(res: ServerResponse, status: number, error: string): void {
 const store = new RadioStore()
 store.setRequested(opts.preset.config)
 store.on('log', (e) => log(`radio: ${e.text}`))
+const listScripts = opts.scripts.length ? startServerScripts(store, opts.scripts, opts.allowTx, log) : () => []
 
 let relays = 0
 const startedAt = Date.now()
@@ -211,7 +219,7 @@ const http = createServer((req, res) => {
       res.writeHead(204)
       return void res.end()
     }
-    return void handleApi(req, res, url, { store, facts })
+    return void handleApi(req, res, url, { store, facts, scripts: listScripts })
   }
   if (req.method !== 'GET' && req.method !== 'HEAD') return refuse(res, 405, 'the console is read-only; the API is under /api')
   void serveStatic(url, res, req.method === 'HEAD')

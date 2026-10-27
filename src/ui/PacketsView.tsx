@@ -1,45 +1,50 @@
 import { useMemo, useState } from 'react'
 import { toHex } from '../protocol/bytes.ts'
 import { LINK_ERROR_NAMES } from '../protocol/client.ts'
-import type { MeshDecode } from '../meshcore/decode.ts'
+import { pluginById, type ByteRegion, type DecodeField } from '../plugins/index.ts'
 import { HexDump, type HexRegion } from './HexDump.tsx'
 import { Button, Card, Empty, Rows, type Row } from './parts.tsx'
 import type { LinkEntry, PacketEntry } from './store.ts'
-import { coords, db, dbm, hz, level, time } from './format.ts'
+import { db, dbm, hz, level, time } from './format.ts'
 
-type Filter = 'all' | 'decoded' | 'failed' | 'no-key' | 'crc'
+type Filter = 'all' | 'decoded' | 'failed' | 'no-key' | 'unknown' | 'crc'
 
 const FILTERS: { id: Filter; label: string }[] = [
   { id: 'all', label: 'All' },
   { id: 'decoded', label: 'Decoded' },
   { id: 'failed', label: 'Failed' },
   { id: 'no-key', label: 'No key' },
+  { id: 'unknown', label: 'No plugin' },
   { id: 'crc', label: 'CRC fail' },
 ]
+
+export const protocolName = (id: string): string => pluginById(id)?.name ?? (id === 'unknown' ? 'no plugin' : id)
 
 function matches(p: PacketEntry, f: Filter): boolean {
   switch (f) {
     case 'all':
       return true
     case 'decoded':
-      return p.rx.crcValid && p.mesh.status === 'decoded'
+      return p.rx.crcValid && p.decode.status === 'decoded'
     case 'failed':
-      return p.mesh.status === 'partial' || p.mesh.status === 'undecodable'
+      return p.decode.status === 'partial' || p.decode.status === 'undecodable'
     case 'no-key':
-      return p.mesh.status === 'no-key'
+      return p.decode.status === 'no-key'
+    case 'unknown':
+      return p.decode.status === 'unknown'
     case 'crc':
       return !p.rx.crcValid
   }
 }
 
-const STATUS_LABEL = { decoded: 'decoded', partial: 'partial', undecodable: 'undecodable', 'no-key': 'no key' }
+const STATUS_LABEL = { decoded: 'decoded', partial: 'partial', undecodable: 'undecodable', 'no-key': 'no key', unknown: 'no plugin' }
 
 export function StatusBadges({ p }: { p: PacketEntry }) {
   return (
     <span className="badges">
       {!p.rx.crcValid && <span className="badge-s badge-crc" title="The radio's payload CRC failed: the bytes may be corrupt, so the decode is untrusted">CRC fail</span>}
-      <span className={`badge-s badge-${p.mesh.status}${p.rx.crcValid ? '' : ' badge-untrusted'}`} title={p.mesh.failure ? `${p.mesh.failure.stage}: ${p.mesh.failure.reason}` : undefined}>
-        {STATUS_LABEL[p.mesh.status]}
+      <span className={`badge-s badge-${p.decode.status}${p.rx.crcValid ? '' : ' badge-untrusted'}`} title={p.decode.failure ? `${p.decode.failure.stage}: ${p.decode.failure.reason}` : undefined}>
+        {STATUS_LABEL[p.decode.status]}
       </span>
     </span>
   )
@@ -78,7 +83,7 @@ export function Packets({ packets, onClear }: { packets: PacketEntry[]; onClear:
           <div className="table-wrap">
             <table className="table packets">
               <thead>
-                <tr><th>Time</th><th>RSSI</th><th>SNR</th><th title="Noise under the packet: RSSI − 10·log10(1 + 10^(SNR/10)), whole dBm">Noise</th><th title="Frequency error the SX126x estimated for the packet (always 0 on firmware 1.5.2)">Freq err (Hz)</th><th>CRC</th><th>Len</th><th>Status</th><th>MeshCore</th></tr>
+                <tr><th>Time</th><th>RSSI</th><th>SNR</th><th title="Noise under the packet: RSSI − 10·log10(1 + 10^(SNR/10)), whole dBm">Noise</th><th title="Frequency error the SX126x estimated for the packet (always 0 on firmware 1.5.2)">Freq err (Hz)</th><th>CRC</th><th>Len</th><th>Status</th><th>Protocol</th><th>Decode</th></tr>
               </thead>
               <tbody>
                 {rows.map((p) => (
@@ -91,8 +96,9 @@ export function Packets({ packets, onClear }: { packets: PacketEntry[]; onClear:
                     <td>{p.rx.crcValid ? <span className="ok">ok</span> : <span className="err">FAIL</span>}</td>
                     <td>{p.rx.data.length}</td>
                     <td><StatusBadges p={p} /></td>
-                    <td className={`summary ${p.mesh.failure && p.mesh.status !== 'no-key' ? 'err' : ''}`}>
-                      {p.mesh.summary}
+                    <td className="muted">{protocolName(p.decode.protocol)}</td>
+                    <td className={`summary ${p.decode.failure && p.decode.status !== 'no-key' ? 'err' : ''}`}>
+                      {p.decode.summary}
                       {p.rx.packetsDropped > 0 && <span className="warn"> · {p.rx.packetsDropped} dropped before</span>}
                     </td>
                   </tr>
@@ -109,21 +115,15 @@ export function Packets({ packets, onClear }: { packets: PacketEntry[]; onClear:
   )
 }
 
-function regionsOf(m: MeshDecode, len: number): HexRegion[] {
-  const out: HexRegion[] = [{ from: 0, to: 1, className: 'hx-header', label: 'header' }]
-  let pos = 1
-  if (m.transportCodes) {
-    out.push({ from: 1, to: 5, className: 'hx-transport', label: 'transport codes' })
-    pos = 5
-  }
-  if (m.hops !== undefined || m.failure?.stage === 'path') out.push({ from: pos, to: pos + 1, className: 'hx-pathlen', label: 'path len' })
-  if (m.path) out.push({ from: pos + 1, to: pos + 1 + m.path.length / 2, className: 'hx-path', label: 'path' })
-  if (m.payloadOffset !== undefined) out.push({ from: m.payloadOffset, to: len, className: 'hx-payload', label: 'payload' })
-  return out
+const hexRegions = (regions: ByteRegion[]): HexRegion[] => regions.map((r) => ({ from: r.from, to: r.to, className: `hx-${r.kind}`, label: r.label }))
+
+function fieldRow(f: DecodeField): Row {
+  const cls = f.tone && f.tone !== 'muted' ? f.tone : undefined
+  const value = f.mono ? <code className={`wrap ${cls ?? ''}`}>{f.value}</code> : cls ? <span className={cls}>{f.value}</span> : f.value
+  return { label: f.label, value, muted: f.tone === 'muted' }
 }
 
 function PacketDetail({ p, onClose }: { p: PacketEntry; onClose: () => void }) {
-  const m = p.mesh
   const radio: Row[] = [
     { label: 'Received', value: new Date(p.at).toLocaleString() },
     { label: 'RSSI / SNR', value: `${dbm(p.rx.rssi)} · ${db(p.rx.snr)}${p.rx.crcValid ? '' : ' (may be meaningless)'}` },
@@ -134,55 +134,26 @@ function PacketDetail({ p, onClose }: { p: PacketEntry; onClose: () => void }) {
     { label: 'Dropped before', value: p.rx.packetsDropped, muted: !p.rx.packetsDropped },
     { label: 'Length', value: `${p.rx.data.length} bytes` },
   ]
+  const d = p.decode
   const decode: Row[] = [{ label: 'Status', value: <StatusBadges p={p} /> }]
-  if (m.failure) {
+  if (d.failure) {
     decode.push({
-      label: m.status === 'no-key' ? 'Not decrypted' : 'Failed',
-      value: <span className={m.status === 'no-key' ? 'muted' : 'err'}>{m.failure.stage} stage, byte {m.failure.offset}: {m.failure.reason}</span>,
+      label: d.status === 'no-key' ? 'Not decrypted' : 'Failed',
+      value: <span className={d.status === 'no-key' ? 'muted' : 'err'}>{d.failure.stage} stage, byte {d.failure.offset}: {d.failure.reason}</span>,
     })
   }
-  if (m.header) {
-    decode.push({ label: 'Type', value: `${m.header.payloadName} (0x${m.header.payloadType.toString(16)}), payload v${m.header.version + 1}` })
-    decode.push({ label: 'Route', value: m.header.routeName + (m.transportCodes ? ` · codes ${m.transportCodes.map((c) => c.toString(16).padStart(4, '0')).join(' ')}` : '') })
-  }
-  if (m.hops !== undefined) decode.push({ label: 'Path', value: m.hops ? `${m.hops} hop${m.hops === 1 ? '' : 's'} × ${m.hashSize} B: ${m.path ? m.path.match(new RegExp(`.{${m.hashSize! * 2}}`, 'g'))?.join(' ') ?? '' : '(not read)'}` : 'direct from the sender (0 hops)' })
-  if (m.payloadLength !== undefined) decode.push({ label: 'Payload', value: `${m.payloadLength} bytes from byte ${m.payloadOffset}` })
-  const a = m.advert
-  if (a) {
-    if (a.name !== undefined) decode.push({ label: 'Name', value: a.name || <span className="muted">(empty)</span> })
-    if (a.typeName) decode.push({ label: 'Node type', value: a.typeName })
-    if (a.publicKey) decode.push({ label: 'Public key', value: <code className="wrap">{a.publicKey}</code> })
-    if (a.timestamp !== undefined) decode.push({ label: 'Advert time', value: new Date(a.timestamp * 1000).toLocaleString() })
-    if (a.hasLocation) decode.push({ label: 'Position', value: coords(a.lat!, a.lon!) })
-    if (a.signatureValid !== undefined) decode.push({ label: 'Signature', value: a.signatureValid ? <span className="ok">valid Ed25519</span> : <span className="err">invalid</span> })
-  }
-  const g = m.group
-  if (g) {
-    if (g.channelHash !== undefined) decode.push({ label: 'Channel hash', value: `0x${g.channelHash.toString(16).padStart(2, '0')}${g.channel ? ` (${g.channel})` : ''}` })
-    if (g.mac) decode.push({ label: 'MAC', value: <code>{g.mac}</code> })
-    if (g.sender !== undefined) decode.push({ label: 'Sender', value: g.sender || <span className="muted">(none)</span> })
-    if (g.body !== undefined) decode.push({ label: 'Text', value: g.body })
-    if (g.timestamp !== undefined) decode.push({ label: 'Sent', value: new Date(g.timestamp * 1000).toLocaleString() })
-    if (g.data !== undefined) decode.push({ label: 'Data', value: <code className="wrap">type 0x{g.dataType!.toString(16)} · {g.data}</code> })
-  }
-  const d = m.addressed
-  if (d) {
-    decode.push({ label: 'Addressing', value: `0x${d.srcHash?.toString(16).padStart(2, '0') ?? '??'} → 0x${d.destHash?.toString(16).padStart(2, '0') ?? '??'}` })
-    if (d.mac) decode.push({ label: 'MAC', value: <code>{d.mac}</code> })
-    if (d.ciphertextLength !== undefined) decode.push({ label: 'Ciphertext', value: `${d.ciphertextLength} bytes (peer-to-peer, not decryptable here)` })
-  }
-  if (m.ackChecksum) decode.push({ label: 'Ack checksum', value: <code>{m.ackChecksum}</code> })
+  decode.push(...d.fields.map(fieldRow))
 
   return (
     <div className="detail">
       <Card title={`Packet #${p.id}`} actions={<Button kind="small" onClick={onClose}>close</Button>}>
         <Rows rows={radio} />
       </Card>
-      <Card title="MeshCore decode">
+      <Card title={`${protocolName(d.protocol)} decode`}>
         <Rows rows={decode} />
       </Card>
       <Card title="Bytes" actions={<Button kind="small" onClick={() => void navigator.clipboard?.writeText(toHex(p.rx.data))}>copy hex</Button>}>
-        <HexDump bytes={p.rx.data} regions={regionsOf(m, p.rx.data.length)} mark={m.failure && m.status !== 'no-key' ? m.failure.offset : undefined} />
+        <HexDump bytes={p.rx.data} regions={hexRegions(d.regions)} mark={d.failure && d.status !== 'no-key' ? d.failure.offset : undefined} />
       </Card>
     </div>
   )
@@ -198,12 +169,15 @@ function exportJson(rows: PacketEntry[], filter: Filter): void {
     crcValid: p.rx.crcValid,
     packetsDropped: p.rx.packetsDropped,
     hex: toHex(p.rx.data),
-    status: p.mesh.status,
-    failure: p.mesh.failure,
-    summary: p.mesh.summary,
-    meshcore: { ...p.mesh, summary: undefined, failure: undefined, status: undefined },
+    protocol: p.decode.protocol,
+    status: p.decode.status,
+    failure: p.decode.failure,
+    summary: p.decode.summary,
+    decode: p.decode.data,
   }))
-  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+  // plugin decodes may hold bytes and 64-bit values, which JSON has no form for
+  const replacer = (_k: string, v: unknown) => (typeof v === 'bigint' ? `0x${v.toString(16)}` : v instanceof Uint8Array ? toHex(v) : v)
+  const blob = new Blob([JSON.stringify(data, replacer, 2)], { type: 'application/json' })
   const a = document.createElement('a')
   a.href = URL.createObjectURL(blob)
   a.download = `donglora-packets-${filter}-${new Date().toISOString().replace(/[:.]/g, '-')}.json`

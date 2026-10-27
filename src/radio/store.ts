@@ -1,15 +1,13 @@
-// Connection state for one dongle session: the client, received packets with their MeshCore decode, heard
-// nodes, the Public channel, stats and the noise floor. Nothing here knows how the bytes travel, so the
-// page (src/ui/store.ts) and the console server (server/) run the same code over different transports.
+// Connection state for one dongle session: the client, received packets decoded by the protocol plugins,
+// the nodes and messages they learned, stats and the noise floor. Nothing here knows how the bytes travel,
+// so the page (src/ui/store.ts), the console server (server/) and scripts see the same session.
 
 import { DongLoRaClient, type KeepaliveHealth, type LinkError, type LinkErrorKind, type Transport } from '../protocol/client.ts'
 import type { Frame } from '../protocol/framing.ts'
 import { Capability } from '../protocol/codes.ts'
 import { hasCapability, type DeviceInfo, type LoRaConfig, type RadioStatus, type RxPacket, type SetConfigReply, type TxDone } from '../protocol/messages.ts'
 import { validateConfig } from '../protocol/lora.ts'
-import { PUBLIC_CHANNEL } from '../meshcore/crypto.ts'
-import { decodeMeshCore, type DecodeStage, type DecodeStatus, type MeshDecode } from '../meshcore/decode.ts'
-import { DEFAULT_PRESET } from '../meshcore/presets.ts'
+import { decodePacket, DEFAULT_PRESET, pluginById, type DecodeStatus, type MessageSighting, type NodeSighting, type PacketDecode } from '../plugins/index.ts'
 import { NoiseFloorTracker, type NoiseFloorState } from '../radio/noiseFloor.ts'
 
 export type Status = 'disconnected' | 'connecting' | 'connected'
@@ -18,7 +16,7 @@ export interface PacketEntry {
   id: number
   at: number // Date.now() when it arrived
   rx: RxPacket
-  mesh: MeshDecode
+  decode: PacketDecode
   /** noise under this packet, dBm (estimate); undefined when the CRC failed */
   noise?: number
 }
@@ -45,30 +43,35 @@ export interface LinkEntry extends LinkError {
   id: number
 }
 
+/** A node some plugin learned about, merged across its sightings. Keyed `${protocol}:${id}` in RadioState.nodes. */
 export interface HeardNode {
-  publicKey: string
+  protocol: string
+  id: string
   name: string
-  type: number
-  typeName: string
+  shortName?: string
+  kind?: string
   firstHeard: number
   lastHeard: number
-  advertTimestamp: number
   rssi: number
   snr: number
-  hops: number
+  hops?: number
   lat?: number
   lon?: number
-  adverts: number
+  /** packets that told us something about it */
+  sightings: number
+  details: Record<string, string>
 }
 
-export interface ChannelPost {
+export interface Message {
   id: number
   at: number
+  protocol: string
   channel: string
   sender: string
-  body: string
-  timestamp: number
-  hops: number
+  text: string
+  /** sender's clock, unix seconds, when the protocol carries one */
+  sentAt?: number
+  hops?: number
   rssi: number
   snr: number
 }
@@ -93,8 +96,8 @@ export interface Stats {
   snrMax?: number
   last?: { rssi: number; snr: number; at: number }
   status: Record<DecodeStatus, number>
-  /** failures by the stage they stopped at (no-key counted under channel) */
-  stages: Partial<Record<DecodeStage, number>>
+  /** failures by plugin and the stage they stopped at, keyed `${protocol}/${stage}` (no-key included) */
+  stages: Partial<Record<string, number>>
   link: Partial<Record<LinkErrorKind, number>>
   linkTotal: number
 }
@@ -116,7 +119,7 @@ export interface RadioState {
   stats: Stats
   health?: KeepaliveHealth
   nodes: Record<string, HeardNode>
-  posts: ChannelPost[]
+  messages: Message[]
   log: SessionEvent[]
   txArmed: boolean
   /** why TX can't be armed on this connection, eg. a console server started without --allow-tx */
@@ -138,6 +141,9 @@ export const radioStatusAvailable = (s: RadioState): boolean => !!s.info && hasC
 
 export interface StoreEvents {
   packet: (p: PacketEntry) => void
+  /** a node was heard; `isNew` the first time this session */
+  node: (n: HeardNode, isNew: boolean) => void
+  message: (m: Message) => void
   linkError: (e: LinkEntry) => void
   frameIn: (f: Frame) => void
   frameOut: (f: Frame) => void
@@ -147,7 +153,7 @@ export interface StoreEvents {
 
 const PACKETS_MAX = 2000
 const LINK_ERRORS_MAX = 500
-const POSTS_MAX = 500
+const MESSAGES_MAX = 500
 const LOG_MAX = 200
 const NOISE_HISTORY_MAX = 600
 /** about 10 minutes of keepalive samples */
@@ -160,7 +166,7 @@ const emptyStats = (): Stats => ({
   good: 0,
   rssiSum: 0,
   snrSum: 0,
-  status: { decoded: 0, partial: 0, undecodable: 0, 'no-key': 0 },
+  status: { decoded: 0, partial: 0, undecodable: 0, 'no-key': 0, unknown: 0 },
   stages: {},
   link: {},
   linkTotal: 0,
@@ -175,7 +181,7 @@ const initialState = (requested: LoRaConfig = DEFAULT_PRESET.config): RadioState
   linkErrors: [],
   stats: emptyStats(),
   nodes: {},
-  posts: [],
+  messages: [],
   log: [],
   txArmed: false,
   noise: new NoiseFloorTracker().snapshot(),
@@ -186,6 +192,8 @@ const initialState = (requested: LoRaConfig = DEFAULT_PRESET.config): RadioState
 
 const initialListeners = (): { [K in keyof StoreEvents]: Set<StoreEvents[K]> } => ({
   packet: new Set(),
+  node: new Set(),
+  message: new Set(),
   linkError: new Set(),
   frameIn: new Set(),
   frameOut: new Set(),
@@ -194,6 +202,38 @@ const initialListeners = (): { [K in keyof StoreEvents]: Set<StoreEvents[K]> } =
 })
 
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err))
+
+function mergeNode(prev: HeardNode | undefined, s: NodeSighting, protocol: string, rx: RxPacket, at: number): HeardNode {
+  return {
+    protocol,
+    id: s.id,
+    name: s.name ?? prev?.name ?? '',
+    shortName: s.shortName ?? prev?.shortName,
+    kind: s.kind ?? prev?.kind,
+    firstHeard: prev?.firstHeard ?? at,
+    lastHeard: at,
+    rssi: rx.rssi,
+    snr: rx.snr,
+    hops: s.hops ?? prev?.hops,
+    lat: s.lat ?? prev?.lat,
+    lon: s.lon ?? prev?.lon,
+    sightings: (prev?.sightings ?? 0) + 1,
+    details: { ...prev?.details, ...s.details },
+  }
+}
+
+const messageOf = (m: MessageSighting, p: PacketEntry, protocol: string, id: number): Message => ({
+  id,
+  at: p.at,
+  protocol,
+  channel: m.channel,
+  sender: m.sender,
+  text: m.text,
+  sentAt: m.sentAt,
+  hops: m.hops,
+  rssi: p.rx.rssi,
+  snr: p.rx.snr,
+})
 
 export class RadioStore {
   private state: RadioState
@@ -400,18 +440,25 @@ export class RadioStore {
   // ---- incoming ----
 
   private onRx(rx: RxPacket): void {
-    const mesh = decodeMeshCore(rx.data, { channels: [PUBLIC_CHANNEL], verifySignatures: true })
     const at = Date.now()
+    const decode = decodePacket(rx.data, rx, this.state.applied?.lora ?? this.state.requested)
     const noiseDbm = this.noise.addPacket(rx.rssi, rx.snr, rx.crcValid, at)
     const noise = this.noise.snapshot(at)
-    const entry: PacketEntry = { id: this.nextId++, at, rx, mesh, noise: noiseDbm }
+    const entry: PacketEntry = { id: this.nextId++, at, rx, decode, noise: noiseDbm }
     const point: NoisePoint = { at, rssi: rx.rssi, crcValid: rx.crcValid, noise: noiseDbm, floor: noise.floor, median: noise.median }
+    // only learn from packets that passed the radio's CRC; the plugin decides what else it trusts
+    const learned = rx.crcValid ? (pluginById(decode.protocol)?.learn?.(decode, rx) ?? {}) : {}
+    const heard: { node: HeardNode; isNew: boolean }[] = []
+    const said: Message[] = []
     this.patch((s) => {
       const st = { ...s.stats, status: { ...s.stats.status }, stages: { ...s.stats.stages } }
       st.rx++
       st.dropped += rx.packetsDropped
-      st.status[mesh.status]++
-      if (mesh.failure) st.stages[mesh.failure.stage] = (st.stages[mesh.failure.stage] ?? 0) + 1
+      st.status[decode.status]++
+      if (decode.failure) {
+        const key = `${decode.protocol}/${decode.failure.stage}`
+        st.stages[key] = (st.stages[key] ?? 0) + 1
+      }
       if (!rx.crcValid) st.crcFail++
       else {
         st.good++
@@ -429,50 +476,26 @@ export class RadioStore {
         noise,
         noiseHistory: [...s.noiseHistory, point].slice(-NOISE_HISTORY_MAX),
       }
-      // only trust what passed both CRCs and decoded cleanly
-      if (rx.crcValid && mesh.status === 'decoded') {
-        const a = mesh.advert
-        if (a?.publicKey && a.signatureValid) {
-          const prev = s.nodes[a.publicKey]
-          next.nodes = {
-            ...s.nodes,
-            [a.publicKey]: {
-              publicKey: a.publicKey,
-              name: a.name ?? prev?.name ?? '',
-              type: a.type ?? 0,
-              typeName: a.typeName ?? '',
-              firstHeard: prev?.firstHeard ?? entry.at,
-              lastHeard: entry.at,
-              advertTimestamp: a.timestamp ?? 0,
-              rssi: rx.rssi,
-              snr: rx.snr,
-              hops: mesh.hops ?? 0,
-              lat: a.hasLocation ? a.lat : prev?.lat,
-              lon: a.hasLocation ? a.lon : prev?.lon,
-              adverts: (prev?.adverts ?? 0) + 1,
-            },
-          }
+      if (learned.nodes?.length) {
+        const nodes = { ...s.nodes }
+        for (const sighting of learned.nodes) {
+          const key = `${decode.protocol}:${sighting.id}`
+          const node = mergeNode(nodes[key], sighting, decode.protocol, rx, at)
+          heard.push({ node, isNew: !nodes[key] })
+          nodes[key] = node
         }
-        const g = mesh.group
-        if (g?.text !== undefined) {
-          const post: ChannelPost = {
-            id: entry.id,
-            at: entry.at,
-            channel: g.channel ?? '',
-            sender: g.sender ?? '',
-            body: g.body ?? '',
-            timestamp: g.timestamp ?? 0,
-            hops: mesh.hops ?? 0,
-            rssi: rx.rssi,
-            snr: rx.snr,
-          }
-          next.posts = [...s.posts, post].slice(-POSTS_MAX)
-        }
+        next.nodes = nodes
+      }
+      if (learned.messages?.length) {
+        for (const m of learned.messages) said.push(messageOf(m, entry, decode.protocol, this.nextId++))
+        next.messages = [...s.messages, ...said].slice(-MESSAGES_MAX)
       }
       return next
     })
     if (rx.packetsDropped) this.log(`device dropped ${rx.packetsDropped} packet${rx.packetsDropped === 1 ? '' : 's'} (RX queue full)`, 'warn')
     this.emit('packet', entry)
+    for (const h of heard) this.emit('node', h.node, h.isNew)
+    for (const m of said) this.emit('message', m)
   }
 
   /** Every keepalive on firmware 1.6.0: a measured noise sample (when receiving), front end and counters. */

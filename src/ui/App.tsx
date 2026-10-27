@@ -1,21 +1,24 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useState, useSyncExternalStore } from 'react'
 import { RADIO_CHIP_NAMES } from '../protocol/codes.ts'
 import { describeConfig } from '../protocol/lora.ts'
 import { isWebSerialSupported } from '../protocol/transports/webserial.ts'
 import { Button, ErrorBoundary } from './parts.tsx'
 import { LinkErrors, Packets } from './PacketsView.tsx'
 import { RadioView } from './RadioView.tsx'
+import { scripts } from './scripts.ts'
+import { ScriptsView } from './ScriptsView.tsx'
 import { Shell } from './Shell.tsx'
 import { defaultServerUrl, store } from './store.ts'
 import { useRadio } from './useRadio.ts'
-import { Channel, Nodes, Overview } from './views.tsx'
+import { Messages, Nodes, Overview } from './views.tsx'
 
-type Tab = 'overview' | 'radio' | 'packets' | 'link' | 'nodes' | 'channel'
+type Tab = 'overview' | 'radio' | 'packets' | 'link' | 'nodes' | 'messages' | 'scripts'
 
 const report = (p: Promise<unknown>) => void p.catch((err: unknown) => store.setError(err))
 
 export function App() {
   const state = useRadio()
+  const scriptsState = useSyncExternalStore(scripts.subscribe, scripts.getState)
   const [tab, setTab] = useState<Tab>('overview')
   const [dockHeight, setDockHeight] = useState(260)
   const connected = state.status === 'connected'
@@ -44,7 +47,8 @@ export function App() {
     { id: 'packets', label: `Packets${st.rx ? ` · ${st.rx}` : ''}${failed + st.crcFail ? ` (${failed} failed, ${st.crcFail} CRC)` : ''}` },
     { id: 'link', label: `Link errors${st.linkTotal ? ` · ${st.linkTotal}` : ''}`, bad: st.linkTotal > 0 },
     { id: 'nodes', label: `Heard nodes${Object.keys(state.nodes).length ? ` · ${Object.keys(state.nodes).length}` : ''}` },
-    { id: 'channel', label: `Public channel${state.posts.length ? ` · ${state.posts.length}` : ''}` },
+    { id: 'messages', label: `Messages${state.messages.length ? ` · ${state.messages.length}` : ''}` },
+    { id: 'scripts', label: `Scripts${scriptsState.running.length ? ` · ${scriptsState.running.length} running` : ''}` },
   ]
   const echo = state.applied?.lora
 
@@ -87,8 +91,8 @@ export function App() {
       )}
 
       <div className="workspace">
-        {state.status === 'disconnected' && !state.info ? (
-          <Welcome webSerial={webSerial} />
+        {state.status === 'disconnected' && !state.info && tab !== 'scripts' ? (
+          <Welcome webSerial={webSerial} onScripts={() => setTab('scripts')} />
         ) : (
           <>
             <nav className="tabs">
@@ -107,7 +111,8 @@ export function App() {
                 {tab === 'packets' && <Packets packets={state.packets} onClear={() => store.clearPackets()} />}
                 {tab === 'link' && <LinkErrors errors={state.linkErrors} counts={st.link} total={st.linkTotal} onClear={() => store.clearLinkErrors()} />}
                 {tab === 'nodes' && <Nodes state={state} />}
-                {tab === 'channel' && <Channel state={state} />}
+                {tab === 'messages' && <Messages state={state} />}
+                {tab === 'scripts' && <ScriptsView />}
               </ErrorBoundary>
             </main>
           </>
@@ -127,7 +132,7 @@ export function App() {
   )
 }
 
-function Welcome({ webSerial }: { webSerial: boolean }) {
+function Welcome({ webSerial, onScripts }: { webSerial: boolean; onScripts: () => void }) {
   const [serverUrl, setServerUrl] = useState(defaultServerUrl)
   return (
     <div className="welcome">
@@ -157,6 +162,13 @@ function Welcome({ webSerial }: { webSerial: boolean }) {
           Connect server
         </Button>
       </div>
+      <h2>Plugins and scripts</h2>
+      <p className="muted small">
+        Protocols are plugins: MeshCore and Meshtastic decode today, and each brings its presets, so pick the protocol by picking
+        its preset on the Radio tab. Scripts are your own JavaScript, run in a sandbox, that react to packets, nodes and messages
+        and drive the radio.{' '}
+        <button className="link" onClick={onScripts}>Open scripts</button>
+      </p>
     </div>
   )
 }

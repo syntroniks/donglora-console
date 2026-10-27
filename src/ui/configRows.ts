@@ -1,6 +1,6 @@
 import { bwKHz, crText, ldro, mhz, syncWordHex } from '../protocol/lora.ts'
 import type { LoRaConfig } from '../protocol/messages.ts'
-import { matchPreset } from '../meshcore/presets.ts'
+import { matchPreset } from '../plugins/index.ts'
 import type { Row } from './parts.tsx'
 
 export function configRows(c: LoRaConfig): Row[] {

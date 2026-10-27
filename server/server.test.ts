@@ -8,7 +8,7 @@ import { WebSocket as WsClient } from 'ws'
 import { DongLoRaClient } from '../src/protocol/client.ts'
 import { ErrCode, SetConfigResult, TxResult } from '../src/protocol/codes.ts'
 import { WebSocketTransport } from '../src/protocol/transports/websocket.ts'
-import { DEFAULT_PRESET } from '../src/meshcore/presets.ts'
+import { DEFAULT_PRESET } from '../src/plugins/index.ts'
 
 const MAIN = fileURLToPath(new URL('./main.ts', import.meta.url))
 

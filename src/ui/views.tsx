@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { CAPABILITY_NAMES, MODULATION_NAMES, OWNER_NAMES, RADIO_CHIP_NAMES, SET_CONFIG_RESULT_NAMES } from '../protocol/codes.ts'
 import { LINK_ERROR_NAMES } from '../protocol/client.ts'
 import { bwKHz, mhz, supportedBws, supportedSfs } from '../protocol/lora.ts'
-import type { DecodeStage } from '../meshcore/decode.ts'
+import { pluginById, stageLabel } from '../plugins/index.ts'
 import { TX_POWER_MEANING_LABELS, txPowerMeaning } from '../radio/frontEnd.ts'
 import { MEDIAN_WINDOW, NOISE_SOURCE_LABELS, NUM_NOISE_FLOOR_SAMPLES } from '../radio/noiseFloor.ts'
 import { NoiseChart } from './NoiseChart.tsx'
@@ -21,15 +21,7 @@ function useNow(ms = 1000): number {
   return now
 }
 
-const STAGES: { stage: DecodeStage; label: string }[] = [
-  { stage: 'header', label: 'Header (truncated, unknown version)' },
-  { stage: 'path', label: 'Path (truncated, reserved hash size, too long)' },
-  { stage: 'payload', label: 'Payload (truncated, unknown type)' },
-  { stage: 'advert', label: 'Advert fields' },
-  { stage: 'signature', label: 'Advert signature' },
-  { stage: 'mac', label: 'Channel MAC' },
-  { stage: 'decrypt', label: 'Decrypt / plaintext' },
-]
+const protocolName = (id: string) => pluginById(id)?.name ?? id
 
 export function Overview({ state }: { state: RadioState }) {
   const now = useNow()
@@ -132,14 +124,17 @@ export function Overview({ state }: { state: RadioState }) {
             { label: 'Partial', value: <span className={st.status.partial ? 'warn' : undefined}>{st.status.partial}</span> },
             { label: 'Undecodable', value: <span className={st.status.undecodable ? 'err' : undefined}>{st.status.undecodable}</span> },
             { label: 'No key', value: st.status['no-key'], muted: true },
+            { label: 'No plugin for the config', value: st.status.unknown, muted: true },
             ...(headerErrs !== undefined
               ? [{ label: '  LoRa header (radio count, no bytes)', value: <span className={headerErrs ? 'err' : 'muted'}>{headerErrs}</span> }]
               : []),
-            ...STAGES.map((s) => ({ label: `  ${s.label}`, value: <span className={st.stages[s.stage] ? 'err' : 'muted'}>{st.stages[s.stage] ?? 0}</span> })),
+            ...Object.entries(st.stages)
+              .sort(([a], [b]) => a.localeCompare(b))
+              .map(([key, n]) => ({ label: `  ${stageLabel(key)}`, value: <span className={n && !key.endsWith('/channel') ? 'err' : 'muted'}>{n ?? 0}</span> })),
           ]}
         />
         <p className="muted small">
-          {failed} failed of {st.rx}; CRC-failed packets are decoded too, and counted here.
+          {failed} failed of {st.rx}; CRC-failed packets are decoded too, and counted here, by plugin and the stage they stopped at.
           {headerErrs !== undefined && ' LoRa header errors come from the radio’s counter (RADIO_STATUS, since connect): the header didn’t decode, so no bytes reach the host and they aren’t in the RX count.'}
         </p>
       </Card>
@@ -191,59 +186,61 @@ export function Nodes({ state }: { state: RadioState }) {
         <div className="table-wrap">
           <table className="table">
             <thead>
-              <tr><th>Name</th><th>Type</th><th>Last heard</th><th>RSSI</th><th>SNR</th><th>Hops</th><th>Position</th><th>Key</th><th>Adverts</th></tr>
+              <tr><th>Name</th><th>Protocol</th><th>Kind</th><th>Last heard</th><th>RSSI</th><th>SNR</th><th>Hops</th><th>Position</th><th>ID</th><th>Heard</th><th>Details</th></tr>
             </thead>
             <tbody>
               {nodes.map((n) => (
-                <tr key={n.publicKey}>
-                  <td>{n.name || <span className="muted">(no name)</span>}</td>
-                  <td>{n.typeName}</td>
-                  <td className="muted" title={`advert timestamp ${new Date(n.advertTimestamp * 1000).toLocaleString()}`}>{ago(n.lastHeard, now)}</td>
+                <tr key={`${n.protocol}:${n.id}`}>
+                  <td>{n.name || <span className="muted">(no name)</span>}{n.shortName && <span className="muted"> · {n.shortName}</span>}</td>
+                  <td className="muted">{protocolName(n.protocol)}</td>
+                  <td>{n.kind ?? <span className="muted">—</span>}</td>
+                  <td className="muted" title={`first heard ${new Date(n.firstHeard).toLocaleString()}`}>{ago(n.lastHeard, now)}</td>
                   <td>{level(n.rssi)}</td>
                   <td>{level(n.snr)}</td>
-                  <td>{n.hops}</td>
+                  <td>{n.hops ?? <span className="muted">—</span>}</td>
                   <td>{n.lat !== undefined && n.lon !== undefined ? coords(n.lat, n.lon) : <span className="muted">—</span>}</td>
-                  <td><code title={n.publicKey}>{shortKey(n.publicKey)}</code></td>
-                  <td>{n.adverts}</td>
+                  <td><code title={n.id}>{n.id.startsWith('!') ? n.id : shortKey(n.id)}</code></td>
+                  <td>{n.sightings}</td>
+                  <td className="muted small">{Object.entries(n.details).map(([k, v]) => `${k} ${v}`).join(' · ')}</td>
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
       ) : (
-        <Empty>Nodes appear when their advert arrives with a good CRC and a valid signature.</Empty>
+        <Empty>Nodes appear when a plugin learns about them from a packet with a good CRC: MeshCore from adverts with a valid signature, Meshtastic from any packet it can decrypt.</Empty>
       )}
     </Card>
   )
 }
 
-export function Channel({ state }: { state: RadioState }) {
+export function Messages({ state }: { state: RadioState }) {
   const end = useRef<HTMLDivElement>(null)
   // braces matter: Chrome's scrollIntoView now returns a Promise, which React would take as a cleanup
   useEffect(() => {
     end.current?.scrollIntoView({ block: 'end' })
-  }, [state.posts.length])
+  }, [state.messages.length])
   return (
     <div className="channel">
       <div className="thread-head">
-        <span className="thread-title">Public</span>
-        <span className="muted small">read-only · decrypted with the default Public key · senders are unverified</span>
+        <span className="thread-title">Messages</span>
+        <span className="muted small">read-only · channel text the plugins could decrypt (MeshCore Public, Meshtastic default channels) · senders are unverified</span>
       </div>
       <div className="thread-list">
-        {state.posts.length ? (
-          state.posts.map((p) => (
-            <div key={p.id} className="bubble bubble-in">
-              {p.sender && <div className="bubble-from">{p.sender}</div>}
-              <div className="bubble-text">{p.body}</div>
+        {state.messages.length ? (
+          state.messages.map((m) => (
+            <div key={m.id} className="bubble bubble-in">
+              <div className="bubble-from">{m.sender || <span className="muted">(no sender)</span>} <span className="muted">· {m.channel || '?'} · {protocolName(m.protocol)}</span></div>
+              <div className="bubble-text">{m.text}</div>
               <div className="bubble-meta">
-                <span>{new Date(p.timestamp * 1000).toLocaleTimeString([], { hour12: false })}</span>
-                <span>{plural(p.hops, 'hop')}</span>
-                <span>{level(p.rssi)} dBm · SNR {level(p.snr)}</span>
+                <span>{new Date(m.sentAt ? m.sentAt * 1000 : m.at).toLocaleTimeString([], { hour12: false })}</span>
+                {m.hops !== undefined && <span>{plural(m.hops, 'hop')}</span>}
+                <span>{level(m.rssi)} dBm · SNR {level(m.snr)}</span>
               </div>
             </div>
           ))
         ) : (
-          <Empty>Public channel posts show up here as they’re heard.</Empty>
+          <Empty>Channel messages show up here as they’re heard.</Empty>
         )}
         <div ref={end} />
       </div>

@@ -3,7 +3,7 @@ import { fromHex } from '../protocol/bytes.ts'
 import { FEM_TYPE_NAMES, FemFlag, FemType, LORA_BANDWIDTHS_KHZ, LORA_CODING_RATES, TX_RESULT_NAMES } from '../protocol/codes.ts'
 import { describeConfig, mhz, supportedBws, supportedSfs, syncWordHex, validateConfig } from '../protocol/lora.ts'
 import type { LoRaConfig } from '../protocol/messages.ts'
-import { matchPreset, PRESETS } from '../meshcore/presets.ts'
+import { matchPreset, PLUGINS, pluginsFor, PRESETS } from '../plugins/index.ts'
 import { FRONT_END_ROWS, FRONT_END_SOURCE_LABELS, frontEndFor, TX_POWER_MEANING_LABELS, txPowerMeaning } from '../radio/frontEnd.ts'
 import { configRows } from './configRows.ts'
 import { Button, Card, Empty, Rows } from './parts.tsx'
@@ -143,11 +143,19 @@ export function RadioView({ state }: { state: RadioState }) {
               const p = PRESETS.find((x) => x.id === e.target.value)
               if (p) setForm(toForm({ ...p.config, txPowerDbm: config.txPowerDbm }))
             }}>
-              {PRESETS.map((p) => (
-                <option key={p.id} value={p.id}>{p.name} — {describeConfig(p.config)}</option>
+              {PLUGINS.map((plugin) => (
+                <optgroup key={plugin.id} label={plugin.name}>
+                  {plugin.presets.map((p) => (
+                    <option key={p.id} value={p.id}>{p.name} — {describeConfig(p.config)}</option>
+                  ))}
+                </optgroup>
               ))}
               <option value="custom">Custom</option>
             </select>
+            <span className="muted small">
+              Decoded by {pluginsFor(config).map((p) => p.name).join(', ') || 'no plugin (packets show as raw bytes)'}. One radio hears one
+              protocol at a time: the sync word, frequency, SF and bandwidth have to match.
+            </span>
           </label>
           <label className="field">
             <span>Frequency (MHz)</span>

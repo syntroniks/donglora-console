@@ -9,9 +9,10 @@ import { CAPABILITY_NAMES, MSG_TYPE_NAMES, MsgType, RADIO_CHIP_NAMES, TX_RESULT_
 import { LINK_ERROR_NAMES } from '../protocol/client.ts'
 import type { Frame } from '../protocol/framing.ts'
 import { bwKHz, describeConfig, mhz, supportedBws, supportedSfs, syncWordHex } from '../protocol/lora.ts'
-import { presetById, PRESETS } from '../meshcore/presets.ts'
+import { matchPreset, pluginById, PLUGINS, presetById, PRESETS } from '../plugins/index.ts'
 import { FRONT_END_ROWS, FRONT_END_SOURCE_LABELS, frontEndFor, TX_POWER_MEANING_LABELS, txPowerMeaning } from '../radio/frontEnd.ts'
 import { MEDIAN_WINDOW, NOISE_SOURCE_LABELS, NUM_NOISE_FLOOR_SAMPLES } from '../radio/noiseFloor.ts'
+import { scripts } from './scripts.ts'
 import { radioStatusAvailable, store, type PacketEntry } from './store.ts'
 import { ago, level, plural, time } from './format.ts'
 
@@ -29,12 +30,13 @@ const PROMPT_ON = C.accent('dongle') + ' $ '
 /** One line per RX event; anything that didn't decode cleanly is red with its reason. */
 function rxLine(p: PacketEntry): string {
   const meta = `${level(p.rx.rssi)} dBm ${level(p.rx.snr)} dB${p.noise !== undefined ? ` noise ${Math.round(p.noise)}` : ''} ${p.rx.data.length}B`
-  const m = p.mesh
+  const m = p.decode
+  const proto = pluginById(m.protocol)?.name ?? 'no plugin'
   const where = m.failure ? ` [${m.failure.stage} @${m.failure.offset}]` : ''
-  if (!p.rx.crcValid) return C.err(`[rx] CRC FAIL ${meta}  (untrusted) ${m.status}${where}: ${m.failure ? m.failure.reason : m.summary}`)
-  if (m.status === 'partial' || m.status === 'undecodable') return C.err(`[rx] ${m.status.toUpperCase()} ${meta}${where}: ${m.failure!.reason}  ${C.dim(toHex(p.rx.data).slice(0, 48))}`)
-  if (m.status === 'no-key') return C.dim(`[rx] no key ${meta}  ${m.summary}`)
-  return `${C.dim('[rx]')} ${C.dim(meta)}  ${m.summary}`
+  if (!p.rx.crcValid) return C.err(`[rx] CRC FAIL ${meta}  (untrusted) ${proto} ${m.status}${where}: ${m.failure ? m.failure.reason : m.summary}`)
+  if (m.status === 'partial' || m.status === 'undecodable') return C.err(`[rx] ${proto} ${m.status.toUpperCase()} ${meta}${where}: ${m.failure!.reason}  ${C.dim(toHex(p.rx.data).slice(0, 48))}`)
+  if (m.status === 'no-key' || m.status === 'unknown') return C.dim(`[rx] ${m.status === 'unknown' ? 'no plugin' : `${proto} no key`} ${meta}  ${m.summary}`)
+  return `${C.dim(`[rx] ${proto}`)} ${C.dim(meta)}  ${m.summary}`
 }
 
 export function Shell() {
@@ -135,7 +137,7 @@ export function Shell() {
         }
         case 'preset': {
           const p = arg ? presetById(arg) : undefined
-          if (!p) return say(C.err(`presets: ${PRESETS.map((x) => x.id.replace('meshcore-', '')).join(', ')}`))
+          if (!p) return say(C.err(`presets: ${PRESETS.map((x) => x.id).join(', ')} (or a unique suffix, eg. us)`))
           await store.applyConfig({ ...p.config, txPowerDbm: s.requested.txPowerDbm })
           say(`${C.ok('applied')} ${p.name}: ${describeConfig(p.config)}`)
           return
@@ -159,7 +161,7 @@ export function Shell() {
           return
         case 'stats': {
           const st = s.stats
-          say(`RX ${st.rx}: ${C.ok(`${st.status.decoded} decoded`)}, ${st.status.partial} partial, ${st.status.undecodable} undecodable, ${st.status['no-key']} no key; ${st.crcFail ? C.err(`${st.crcFail} CRC fail`) : '0 CRC fail'}; ${st.dropped} dropped by device`)
+          say(`RX ${st.rx}: ${C.ok(`${st.status.decoded} decoded`)}, ${st.status.partial} partial, ${st.status.undecodable} undecodable, ${st.status['no-key']} no key, ${st.status.unknown} no plugin; ${st.crcFail ? C.err(`${st.crcFail} CRC fail`) : '0 CRC fail'}; ${st.dropped} dropped by device`)
           const stages = Object.entries(st.stages).map(([k, v]) => `${k} ${v}`).join(', ')
           if (stages) say(`decode failures by stage: ${stages}`)
           const link = Object.entries(st.link).map(([k, v]) => `${LINK_ERROR_NAMES[k as keyof typeof LINK_ERROR_NAMES]} ${v}`).join(', ')
@@ -201,8 +203,39 @@ export function Shell() {
         }
         case 'nodes': {
           const nodes = Object.values(s.nodes).sort((a, b) => b.lastHeard - a.lastHeard)
-          if (!nodes.length) return say(C.dim('no adverts heard yet'))
-          for (const n of nodes) say(`  ${(n.name || '(no name)').padEnd(22)} ${n.typeName.padEnd(12)} ${plural(n.hops, 'hop').padEnd(7)} ${level(n.rssi)} dBm ${C.dim(`${ago(n.lastHeard)} · ${n.publicKey.slice(0, 8)}`)}`)
+          if (!nodes.length) return say(C.dim('no nodes heard yet'))
+          for (const n of nodes) {
+            const hops = n.hops !== undefined ? plural(n.hops, 'hop') : '?'
+            say(`  ${(n.name || '(no name)').padEnd(22)} ${(pluginById(n.protocol)?.name ?? n.protocol).padEnd(11)} ${(n.kind ?? '').padEnd(12)} ${hops.padEnd(7)} ${level(n.rssi)} dBm ${C.dim(`${ago(n.lastHeard)} · ${n.id.slice(0, 9)}`)}`)
+          }
+          return
+        }
+        case 'plugins': {
+          const active = matchPreset(s.applied?.lora ?? s.requested)
+          for (const p of PLUGINS) {
+            const claims = p.claims(s.applied?.lora ?? s.requested)
+            say(`${C.accent(p.name.padEnd(11))} ${p.description}${claims ? C.ok('  (decoding)') : ''}`)
+            say(C.dim(`  presets: ${p.presets.map((x) => (x.id === active?.id ? C.ok(x.id) + '\x1b[90m' : x.id)).join(', ')}`))
+          }
+          return
+        }
+        case 'scripts': {
+          const st = scripts.getState()
+          if (!st.scripts.length) return say(C.dim('no scripts yet: the Scripts tab has examples'))
+          for (const x of st.scripts) say(`  ${st.running.includes(x.id) ? C.ok('running') : C.dim('stopped')} ${x.name}${x.allowTx ? C.warn(' (may transmit)') : ''}${x.runOnConnect ? C.dim(' · runs when connected') : ''}`)
+          return
+        }
+        case 'run':
+        case 'stop': {
+          const name = args.join(' ')
+          if (cmd === 'stop' && name === 'all') {
+            for (const id of scripts.getState().running) scripts.stop(id)
+            return
+          }
+          const x = name ? scripts.byName(name) : undefined
+          if (!x) return say(C.err(`no script '${name}'; /scripts lists them`))
+          if (cmd === 'run') scripts.run(x.id)
+          else scripts.stop(x.id)
           return
         }
         case 'tx': {
@@ -243,6 +276,7 @@ export function Shell() {
         }
       }),
       store.on('packet', (p) => flags.rx && out(rxLine(p))),
+      scripts.onLine((spec, l) => out((l.level === 'err' ? C.err : l.level === 'warn' ? C.warn : (t: string) => t)(`${C.accent(`[${spec.name}]`)} ${l.text}`))),
       store.on('linkError', (e) => out(C.err(`[link] ${LINK_ERROR_NAMES[e.kind]}: ${e.reason}`) + C.dim(`  ${toHex(e.bytes.subarray(0, 24), ' ')}${e.bytes.length > 24 ? ' …' : ''}`))),
       store.on('log', (e) => out(e.level === 'info' ? C.dim(`[session] ${e.text}`) : e.level === 'warn' ? C.warn(`[session] ${e.text}`) : C.err(`[session] ${e.text}`))),
       store.on('frameOut', (f) => {

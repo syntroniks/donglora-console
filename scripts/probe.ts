@@ -1,7 +1,8 @@
 // Receive-only check against a real dongle over USB:
-//   pnpm probe [port] [--seconds 60]
-// GET_INFO, SET_CONFIG with the MeshCore USA/Canada preset, RX_START, then every RX event for N seconds
-// (failed ones with their reasons and bytes), then RX_STOP and a summary. It never transmits.
+//   pnpm probe [port] [--seconds 60] [--preset meshcore-us]
+// GET_INFO, SET_CONFIG with a plugin preset (MeshCore USA/Canada unless --preset), RX_START, then every RX
+// event for N seconds decoded by the plugins (failed ones with their reasons and bytes), then RX_STOP and a
+// summary. It never transmits.
 // When GET_INFO sets capability bit 33 (firmware 1.6.0, protocol v1.1) the keepalive is RADIO_STATUS, and
 // once a second the probe prints its instantaneous RSSI, the measured noise floor, the device's RX
 // counters and the front-end state.
@@ -13,8 +14,7 @@ import { Capability, CAPABILITY_NAMES, FEM_TYPE_NAMES, FemFlag, RADIO_CHIP_NAMES
 import { describeConfig, mhz, syncWordHex } from '../src/protocol/lora.ts'
 import { hasCapability, type RadioStatus } from '../src/protocol/messages.ts'
 import { intervalTicker } from '../src/protocol/ticker.ts'
-import { decodeMeshCore, type DecodeStage, type DecodeStatus } from '../src/meshcore/decode.ts'
-import { DEFAULT_PRESET } from '../src/meshcore/presets.ts'
+import { decodePacket, DEFAULT_PRESET, pluginById, presetById, PRESETS, type DecodeStatus } from '../src/plugins/index.ts'
 import { MEDIAN_WINDOW, NoiseFloorTracker, NUM_NOISE_FLOOR_SAMPLES } from '../src/radio/noiseFloor.ts'
 import { findDongles, NodeSerialTransport } from './node-serial.ts'
 
@@ -24,7 +24,13 @@ const flag = (name: string) => {
   return i >= 0 ? args[i + 1] : undefined
 }
 const seconds = Number(flag('--seconds') ?? 60)
-const pathArg = args.find((a, i) => !a.startsWith('--') && args[i - 1] !== '--seconds')
+const pathArg = args.find((a, i) => !a.startsWith('--') && args[i - 1] !== '--seconds' && args[i - 1] !== '--preset')
+const found = flag('--preset') ? presetById(flag('--preset')!) : DEFAULT_PRESET
+if (!found) {
+  console.error(`unknown --preset ${flag('--preset')}; one of ${PRESETS.map((p) => p.id).join(', ')}`)
+  process.exit(1)
+}
+const preset = found
 
 const dongles = await findDongles()
 const path = pathArg ?? dongles[0]?.path
@@ -44,8 +50,8 @@ client.transmit = () => Promise.reject(new Error('probe never transmits'))
 
 const t0 = Date.now()
 const stamp = () => `+${((Date.now() - t0) / 1000).toFixed(1).padStart(6)}s`
-const status: Record<DecodeStatus, number> = { decoded: 0, partial: 0, undecodable: 0, 'no-key': 0 }
-const stages: Partial<Record<DecodeStage, number>> = {}
+const status: Record<DecodeStatus, number> = { decoded: 0, partial: 0, undecodable: 0, 'no-key': 0, unknown: 0 }
+const stages: Partial<Record<string, number>> = {}
 const link: Partial<Record<LinkErrorKind, number>> = {}
 let rx = 0
 let crcFail = 0
@@ -96,9 +102,9 @@ function printStatus(): void {
 client.on('rx', (p) => {
   rx++
   dropped += p.packetsDropped
-  const d = decodeMeshCore(p.data)
+  const d = decodePacket(p.data, p, client.applied?.lora ?? preset.config)
   status[d.status]++
-  if (d.failure) stages[d.failure.stage] = (stages[d.failure.stage] ?? 0) + 1
+  if (d.failure) stages[`${d.protocol}/${d.failure.stage}`] = (stages[`${d.protocol}/${d.failure.stage}`] ?? 0) + 1
   if (p.crcValid) {
     rssi.push(p.rssi)
     snr.push(p.snr)
@@ -107,16 +113,17 @@ client.on('rx', (p) => {
   if (n !== undefined) noiseEstimates.push(n)
   const meta = `${p.rssi} dBm ${p.snr} dB noise ${n !== undefined ? Math.round(n) : '-'} ferr ${p.freqErr} Hz ${p.data.length}B${p.packetsDropped ? ` (${p.packetsDropped} dropped before)` : ''}`
   const crc = p.crcValid ? 'crc ok  ' : 'CRC FAIL'
-  if (d.status === 'decoded' || d.status === 'no-key') {
+  if (d.status === 'decoded' || d.status === 'no-key' || d.status === 'unknown') {
     console.log(`${stamp()} ${crc} ${meta}  ${d.status}: ${d.summary}`)
   } else {
     console.log(`${stamp()} ${crc} ${meta}  ${d.status.toUpperCase()} at ${d.failure!.stage} stage, byte ${d.failure!.offset}: ${d.failure!.reason}`)
     console.log(`           ${toHex(p.data, ' ')}`)
   }
   if (!p.crcValid && d.status === 'decoded') console.log('           (decoded, but the radio CRC failed: untrusted)')
-  if (p.crcValid && d.status === 'decoded') {
-    if (d.advert?.publicKey) nodes.set(d.advert.publicKey, `${d.advert.name || '(no name)'} [${d.advert.typeName}] ${p.rssi} dBm ${p.snr} dB, ${d.hops} hops`)
-    if (d.group?.text !== undefined) posts.push(`${d.group.channel}: ${d.group.text}`)
+  if (p.crcValid) {
+    const learned = pluginById(d.protocol)?.learn?.(d, p) ?? {}
+    for (const n of learned.nodes ?? []) nodes.set(`${d.protocol}:${n.id}`, `${n.name || '(no name)'} [${d.protocol}${n.kind ? ` ${n.kind}` : ''}] ${p.rssi} dBm ${p.snr} dB${n.hops !== undefined ? `, ${n.hops} hops` : ''}`)
+    for (const m of learned.messages ?? []) posts.push(`${m.channel} · ${m.sender}: ${m.text}`)
   }
 })
 client.on('linkError', (e) => {
@@ -141,7 +148,7 @@ async function stop(): Promise<void> {
   await client.disconnect()
   const range = (xs: number[]) => (xs.length ? `${Math.min(...xs)} … ${Math.max(...xs)} (avg ${(xs.reduce((a, b) => a + b, 0) / xs.length).toFixed(1)})` : '-')
   console.log('\nsummary')
-  console.log(`  listened      ${((Date.now() - t0) / 1000).toFixed(0)} s on ${describeConfig(DEFAULT_PRESET.config)}`)
+  console.log(`  listened      ${((Date.now() - t0) / 1000).toFixed(0)} s on ${describeConfig(preset.config)}`)
   console.log(`  RX events     ${rx}: CRC ok ${rx - crcFail}, CRC fail ${crcFail}; dropped by device ${dropped}`)
   console.log(`  decode        ${Object.entries(status).map(([k, v]) => `${k} ${v}`).join(', ')}`)
   console.log(`  failed stage  ${Object.entries(stages).map(([k, v]) => `${k} ${v}`).join(', ') || 'none'}`)
@@ -163,7 +170,7 @@ async function stop(): Promise<void> {
   } else console.log('  RADIO_STATUS  not supported by this firmware (no capability bit 33)')
   console.log(`  nodes         ${nodes.size ? '' : 'none'}`)
   for (const n of nodes.values()) console.log(`    ${n}`)
-  console.log(`  Public posts  ${posts.length ? '' : 'none'}`)
+  console.log(`  messages      ${posts.length ? '' : 'none'}`)
   for (const p of posts) console.log(`    ${p}`)
   const h = client.health
   console.log(`  keepalive     ${h.pings} ${h.command} ok, ${h.failures} failed, avg rtt ${h.avgRttMs?.toFixed(1) ?? '-'} ms, longest gap ${h.maxGapMs} ms, sessions lost ${h.lostSessions}`)
@@ -180,11 +187,11 @@ statusSupported = hasCapability(info, Capability.RadioStatus)
 console.log(`GET_INFO: DongLoRa ${info.firmware.major}.${info.firmware.minor}.${info.firmware.patch}, protocol ${info.protocol.major}.${info.protocol.minor}, ${RADIO_CHIP_NAMES[info.radioChipId]}`)
 console.log(`  ${mhz(info.freqMinHz)}–${mhz(info.freqMaxHz)} MHz, ${info.txPowerMinDbm}…${info.txPowerMaxDbm} dBm, SF bitmap 0x${info.sfBitmap.toString(16)}, BW bitmap 0x${info.bwBitmap.toString(16)}`)
 console.log(`  caps ${caps.join(', ')} (0x${info.capabilities.toString(16)}), max payload ${info.maxPayloadBytes}, RX queue ${info.rxQueueCapacity}, TX queue ${info.txQueueCapacity}, MCU UID ${info.mcuUid}`)
-const reply = await client.setConfig(DEFAULT_PRESET.config)
+const reply = await client.setConfig(preset.config)
 const e = reply.lora
-console.log(`SET_CONFIG ${DEFAULT_PRESET.name}: result ${reply.result}, owner ${reply.owner}`)
+console.log(`SET_CONFIG ${preset.name}: result ${reply.result}, owner ${reply.owner}`)
 console.log(e ? `  echo: ${describeConfig(e)}, preamble ${e.preambleLen}, sync ${syncWordHex(e.syncWord)}, ${e.txPowerDbm} dBm, ${e.implicitHeader ? 'implicit' : 'explicit'} header, CRC ${e.payloadCrc ? 'on' : 'off'}, IQ ${e.iqInvert ? 'inverted' : 'normal'}` : `  echo: modulation ${reply.modulation}, ${toHex(reply.params)}`)
-const same = e && JSON.stringify(e) === JSON.stringify(DEFAULT_PRESET.config)
+const same = e && JSON.stringify(e) === JSON.stringify(preset.config)
 console.log(`  ${same ? 'matches the request' : 'DIFFERS from the request'}`)
 await client.rxStart()
 listening = true

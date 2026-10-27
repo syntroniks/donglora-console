@@ -135,7 +135,16 @@ describe('console server, TX refused (default)', () => {
 describe('console server with --allow-tx', () => {
   let s: Running
   beforeAll(async () => {
-    s = await start('--allow-tx')
+    s = await start('--allow-tx', '--tx-power', '22')
+  })
+
+  it('asks for the --tx-power it was given', async () => {
+    const state = await until(async () => {
+      const { body } = await getJson(`${s.base}/api/config`)
+      return (body.applied as { lora?: { txPowerDbm: number } } | undefined)?.lora ? body : undefined
+    })
+    expect((state.requested as { txPowerDbm: number }).txPowerDbm).toBe(22)
+    expect((state.applied as { lora: { txPowerDbm: number } }).lora.txPowerDbm).toBe(22)
   })
   afterAll(() => {
     s?.child.kill()

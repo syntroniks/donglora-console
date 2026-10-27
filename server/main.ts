@@ -38,6 +38,8 @@ byte stream on /ws for the console's "Connect server", and the built console on 
   --allow-origin <url>    another web origin allowed to use the API (repeatable);
                           https://syntroniks.github.io and this server are allowed
   --allow-tx              let /api/tx and /ws clients transmit (refused otherwise)
+  --tx-power <dBm>        TX power in the session's config (default: the preset's, 10);
+                          checked against the dongle's GET_INFO range
   --preset <id>           config the server's session asks for (default ${DEFAULT_PRESET.id}):
                           ${PRESETS.map((p) => p.id).join(', ')}
   --script <file.js>      run a script against the server's session (repeatable); it runs
@@ -72,6 +74,7 @@ function options() {
         'allow-origin': { type: 'string', multiple: true, default: [] },
         'allow-tx': { type: 'boolean', default: false },
         preset: { type: 'string', default: DEFAULT_PRESET.id },
+        'tx-power': { type: 'string' },
         script: { type: 'string', multiple: true, default: [] },
         help: { type: 'boolean', short: 'h', default: false },
       },
@@ -87,6 +90,8 @@ function options() {
   if (!Number.isInteger(port) || port < 0 || port > 65535) fail(`--port ${parsed.port} isn't a port number`)
   const preset = presetById(parsed.preset)
   if (!preset) fail(`unknown --preset ${parsed.preset}`)
+  const txPower = parsed['tx-power'] === undefined ? preset.config.txPowerDbm : Number(parsed['tx-power'])
+  if (!Number.isInteger(txPower) || txPower < -30 || txPower > 40) fail(`--tx-power ${parsed['tx-power']} isn't a whole number of dBm`)
   if (parsed.demo && parsed.mux) fail('--demo and --mux are exclusive')
   for (const o of parsed['allow-origin']) if (!/^https?:\/\/[^/]+$/.test(o)) fail(`--allow-origin ${o} isn't an origin like https://example.com`)
   for (const f of parsed.script) if (!existsSync(f)) fail(`--script ${f}: no such file`)
@@ -98,6 +103,7 @@ function options() {
     allowTx: parsed['allow-tx'],
     origins: new Set([...DEFAULT_ORIGINS, ...parsed['allow-origin']]),
     preset,
+    config: { ...preset.config, txPowerDbm: txPower },
     scripts: parsed.script,
   }
 }
@@ -143,7 +149,7 @@ function refuse(res: ServerResponse, status: number, error: string): void {
 // ---- the server's own session -----------------------------------------------------------------------
 
 const store = new RadioStore()
-store.setRequested(opts.preset.config)
+store.setRequested(opts.config)
 store.on('log', (e) => log(`radio: ${e.text}`))
 const listScripts = opts.scripts.length ? startServerScripts(store, opts.scripts, opts.allowTx, log) : () => []
 
@@ -262,7 +268,7 @@ http.listen(opts.port, opts.host, () => {
   const port = address && typeof address === 'object' ? address.port : opts.port
   const where = `http://${opts.host.includes(':') ? `[${opts.host}]` : opts.host}:${port}`
   log(`donglora-console server ${VERSION} on ${where}  (API ${where}/api, console ${where}/, /ws for "Connect server")`)
-  log(`upstream: ${opts.upstream.label}; session config: ${opts.preset.name}, ${describeConfig(opts.preset.config)}`)
+  log(`upstream: ${opts.upstream.label}; session config: ${opts.preset.name}, ${describeConfig(opts.config)}, TX power ${opts.config.txPowerDbm} dBm`)
   log(`TX ${opts.allowTx ? 'ALLOWED (--allow-tx)' : 'refused'}; origins: this server, ${[...opts.origins].join(', ')}`)
   if (exposed) log(`warning: listening on ${opts.host}, not loopback: anyone who reaches it can use the radio`)
   void keepConnected()

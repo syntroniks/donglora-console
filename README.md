@@ -77,7 +77,8 @@ on the welcome screen and remembered; on `*.github.io` it defaults to `ws://loca
 | `--demo` | simulated dongle, one per connection |
 | `--port <n>` / `--host <addr>` | listen address, default `127.0.0.1:5742` |
 | `--allow-origin <url>` | another web origin allowed to use the API and `/ws` (repeatable) |
-| `--allow-tx` | let `/api/tx` and `/ws` clients transmit |
+| `--allow-tx` | let `/api/tx`, `/ws` clients and scripts transmit |
+| `--tx-power <dBm>` | TX power in the session's config (the preset's 10 dBm otherwise); the dongle's GET_INFO range applies |
 | `--preset <id>` | config the server's session asks for, default `meshcore-us`; any plugin preset |
 | `--script <file.js>` | run a [script](#scripts) against the server's session (repeatable) |
 

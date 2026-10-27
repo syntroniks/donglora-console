@@ -3,7 +3,7 @@
 // what it asks the host for over messages:
 //
 //   radio.state() info() config() setConfig(presetIdOrFields) rxStart() rxStop() ping() status()
-//         tx(hexOrBytes) packets(limit) nodes() messages(limit) plugins()
+//         tx(hexOrBytes) say(text, { channel, sender, protocol }) packets(limit) nodes() messages(limit) plugins()
 //   on(event, handler) -> off     'packet' 'node' 'message' 'link-error' 'log' 'connected' 'disconnected'
 //   every(ms, fn) -> cancel       sleep(ms)       print(...values)       warn(...values)
 //   storage.get(key) storage.set(key, value)   kept per script by the host
@@ -67,6 +67,7 @@ export function runSandbox(ch: SandboxChannel): void {
     ping: () => call('ping'),
     status: () => call('status'),
     tx: (data: string | Uint8Array) => call('tx', typeof data === 'string' ? data : hex(data)),
+    say: (text: string, opts: { channel?: string; sender?: string; protocol?: string } = {}) => call('say', text, opts),
     packets: (limit = 20) => call('packets', limit),
     nodes: () => call('nodes'),
     messages: (limit = 50) => call('messages', limit),

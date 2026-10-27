@@ -90,6 +90,34 @@ export interface Learned {
   messages?: MessageSighting[]
 }
 
+export interface ComposeInput {
+  /** one of `channels(config)` */
+  channel: string
+  text: string
+  /** the sender's display name; what a protocol does with it is up to the plugin */
+  sender: string
+  /** unix seconds */
+  now: number
+}
+
+export interface Composed {
+  /** the packet to transmit */
+  bytes: Uint8Array
+  /** how the message shows in the list; its `key` matches what `learn` gives the mesh's copies of it */
+  message: MessageSighting
+}
+
+/** Sending channel text. The packet goes out as it is; the console arms and gates TX. */
+export interface Composer {
+  /** channels that can be posted to with this radio config, best match first */
+  channels(config: LoRaConfig): string[]
+  /** the most UTF-8 bytes of text one packet carries for this sender */
+  maxTextBytes(sender: string): number
+  /** why this sender name can't be used, if it can't */
+  senderProblem?(sender: string): string | undefined
+  build(input: ComposeInput): Composed
+}
+
 export interface ProtocolPlugin {
   id: string
   name: string
@@ -102,4 +130,6 @@ export interface ProtocolPlugin {
   decode(raw: Uint8Array, rx: RxPacket): PacketDecode
   /** what a packet with a good CRC tells about nodes and messages. Only trust what the protocol lets you trust. */
   learn?(decode: PacketDecode, rx: RxPacket): Learned
+  /** present when the plugin can send channel messages */
+  compose?: Composer
 }

@@ -79,6 +79,7 @@ on the welcome screen and remembered; on `*.github.io` it defaults to `ws://loca
 | `--allow-origin <url>` | another web origin allowed to use the API and `/ws` (repeatable) |
 | `--allow-tx` | let `/api/tx`, `/ws` clients and scripts transmit |
 | `--tx-power <dBm>` | TX power in the session's config (the preset's 10 dBm otherwise); the dongle's GET_INFO range applies |
+| `--name <sender>` | the name `POST /api/messages` and scripts' `radio.say()` send as when none is given (default `DongLoRa`) |
 | `--preset <id>` | config the server's session asks for, default `meshcore-us`; any plugin preset |
 | `--script <file.js>` | run a [script](#scripts) against the server's session (repeatable) |
 
@@ -100,7 +101,8 @@ answered ERR, 503 when the server has no dongle session and 504 on a timeout.
 | `POST /api/rx/start` / `POST /api/rx/stop` | RX for the server's session |
 | `GET /api/packets?limit=50&after=<id>&protocol=<id>` | received packets with their plugin decode, newest first |
 | `GET /api/nodes?protocol=<id>` | nodes the plugins learned about, most recently heard first |
-| `GET /api/messages?limit=100&protocol=<id>` | channel messages, newest first |
+| `GET /api/messages?limit=100&protocol=<id>` | channel messages, newest first, received and sent |
+| `POST /api/messages` | post `{"text", "channel"?, "sender"?, "protocol"?}` through the plugin for the radio config; only with `--allow-tx` |
 | `GET /api/scripts` | scripts started with `--script`, running or not, with their recent output |
 | `GET /api/radio` | last RADIO_STATUS, counters at the start of the session, noise floor, keepalive health |
 | `GET /api/link-errors?limit=100` / `GET /api/log` | link errors and the session log, newest first |
@@ -149,6 +151,23 @@ against packets it built itself; it hasn't decoded real traffic yet.
 A new plugin implements `ProtocolPlugin` in `src/plugins/types.ts` and goes in the `PLUGINS` list in
 `src/plugins/index.ts`.
 
+## Sending messages
+
+The Messages view has a compose bar: pick the channel, set your name, type, Enter. It sends through the plugin that
+decodes the current radio config, so the preset you're on decides the protocol.
+
+- **MeshCore** posts to the Public channel, flood-routed, as `name: text` (up to 160 bytes together, MeshCore's
+  limit), exactly like a companion app.
+- **Meshtastic** broadcasts text on the default channel of the modem preset you're on, with the default key, three hops.
+  It sends as a `!node` id derived from your name, and sends no node info, so other radios show the id, not the name.
+
+A message only goes out while TX is armed. Arming asks once and shows the frequency and power; while armed, messages send
+without asking again, and the bar shows where and how loud. Your messages show on the right with how long they were on
+air. When repeaters forward one, this radio hears the copies and the bubble says *heard back n×*, which is the
+confirmation that the mesh carried it. `/say <text>` in the shell does the same, `radio.say(text, { channel, sender })`
+from a script, and `POST /api/messages` on the console server (`--allow-tx`, sender from `--name`). Through mux every
+client sends with the config the lock holder set, including its TX power.
+
 ## Scripts
 
 Scripts are your own JavaScript. On the Scripts tab you write them, start them from examples, run and stop them, and
@@ -195,6 +214,8 @@ get one `message` event per message; the Packets tab still lists every copy.
   applies.
 - The console server refuses TX, on `/api/tx`, `/ws` and from scripts, unless it was started with `--allow-tx`.
 - A script transmits only if you ticked *may transmit* for it (the console asks), and only while TX is armed.
+- Messages sent from the Messages view or `/say` don't ask per message: arming TX is the consent, and the compose
+  bar shows the frequency and power while armed. Raw TX (`/tx`, the Radio tab) still asks every time.
 - The demo radio and the unit tests are the only things that have exercised TX.
 
 ## Errors are shown, not dropped

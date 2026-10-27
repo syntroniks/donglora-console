@@ -36,6 +36,8 @@ export interface ScriptHostOptions {
   /** arm TX for a permitted script (the server, started with --allow-tx); the page leaves arming to the user */
   armForTx?: boolean
   output(spec: ScriptSpec, line: ScriptLine): void
+  /** the sender name radio.say() uses when the script doesn't give one */
+  defaultSender?(): string
   storage: {
     get(scriptId: string, key: string): unknown
     set(scriptId: string, key: string, value: unknown): void
@@ -196,6 +198,16 @@ export class ScriptHost {
         if (this.opts.armForTx && !st.txArmed) s.armTx(true)
         this.line(r.spec, 'warn', `TX ${hex.length / 2} B`)
         return s.transmit(fromHex(hex))
+      }
+      case 'say': {
+        const why = this.opts.txRefusal(r.spec)
+        if (why) throw new Error(`say(): ${why}`)
+        const opts = (args[1] && typeof args[1] === 'object' ? args[1] : {}) as { channel?: unknown; sender?: unknown; protocol?: unknown }
+        const str = (v: unknown) => (typeof v === 'string' ? v : undefined)
+        const sender = str(opts.sender) ?? this.opts.defaultSender?.() ?? ''
+        if (this.opts.armForTx && !st.txArmed) s.armTx(true)
+        this.line(r.spec, 'warn', `say: ${String(args[0] ?? '')}`)
+        return s.sendMessage({ text: String(args[0] ?? ''), sender, channel: str(opts.channel), protocol: str(opts.protocol) })
       }
       case 'packets':
         return st.packets.slice(0, count(args[0], 1, 2000, 20))

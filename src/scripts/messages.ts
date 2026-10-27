@@ -14,6 +14,7 @@ export const SCRIPT_METHODS = [
   'ping',
   'status',
   'tx',
+  'say',
   'packets',
   'nodes',
   'messages',

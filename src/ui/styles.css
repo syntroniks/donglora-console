@@ -261,3 +261,11 @@ button.link:hover { text-decoration: underline; }
 .script-output .err { color: var(--err); }
 .script-api { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 12px; margin: 0 0 8px; white-space: pre-wrap; color: var(--text); }
 @media (max-width: 900px) { .scripts { grid-template-columns: minmax(0, 1fr); } }
+
+/* sending messages */
+.compose { border-top: 1px solid var(--border); padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; background: var(--panel); }
+.compose-row { display: flex; gap: 8px; align-items: center; }
+.compose select, .compose input { font: inherit; font-size: 13px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; }
+.compose select:focus, .compose input:focus { outline: none; border-color: var(--accent); }
+.compose-sender { width: 150px; }
+.compose-text { flex: 1; min-width: 120px; }

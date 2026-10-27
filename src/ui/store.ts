@@ -33,6 +33,11 @@ export function defaultServerUrl(): string {
 }
 
 const SERVER_URL_KEY = 'donglora-console.serverUrl'
+const SENDER_KEY = 'donglora-console.sender'
+
+/** The name messages are sent as (Messages view, /say, scripts' radio.say), kept in this browser. */
+export const savedSender = (): string => localStorage.getItem(SENDER_KEY) ?? ''
+export const saveSender = (name: string): void => localStorage.setItem(SENDER_KEY, name.trim())
 
 export class ConsoleStore extends RadioStore {
   /** Must run synchronously inside the click handler: WebSerial's port picker needs the user gesture. */

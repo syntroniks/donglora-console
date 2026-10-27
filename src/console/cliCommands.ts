@@ -25,6 +25,7 @@ export const LOCAL_COMMANDS: CommandHelp[] = [
   { usage: '/scripts', summary: 'saved scripts and which are running (edit them on the Scripts tab)' },
   { usage: '/run <script>', summary: 'start a script by name' },
   { usage: '/stop <script>', summary: 'stop a script by name, or all of them with /stop all' },
+  { usage: '/say <text>', summary: 'post to the channel the Messages view would, as your saved name; needs TX armed' },
   { usage: '/tx <hex>', summary: 'transmit raw bytes; needs TX armed on the Radio tab, asks to confirm' },
 ]
 

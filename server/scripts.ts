@@ -30,7 +30,7 @@ export function spawnScriptWorker(): HostChannel {
   }
 }
 
-export function startServerScripts(store: RadioStore, files: string[], allowTx: boolean, log: (text: string) => void): () => ServerScript[] {
+export function startServerScripts(store: RadioStore, files: string[], allowTx: boolean, sender: string, log: (text: string) => void): () => ServerScript[] {
   const data = new Map<string, Map<string, unknown>>()
   const output = new Map<string, ScriptLine[]>()
   const specs: (ScriptSpec & { file: string })[] = files.map((file, i) => ({ id: `script${i + 1}`, name: basename(file).replace(/\.[cm]?[jt]s$/, ''), file, source: readFileSync(file, 'utf8'), allowTx }))
@@ -38,6 +38,7 @@ export function startServerScripts(store: RadioStore, files: string[], allowTx: 
     spawn: spawnScriptWorker,
     txRefusal: (spec) => (spec.allowTx ? undefined : 'the server was started without --allow-tx'),
     armForTx: true,
+    defaultSender: () => sender,
     output: (spec, line) => {
       output.set(spec.id, [...(output.get(spec.id) ?? []), line].slice(-OUTPUT_MAX))
       log(`[${spec.name}] ${line.level === 'info' ? '' : `${line.level}: `}${line.text}`)

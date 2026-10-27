@@ -40,6 +40,8 @@ byte stream on /ws for the console's "Connect server", and the built console on 
   --allow-tx              let /api/tx and /ws clients transmit (refused otherwise)
   --tx-power <dBm>        TX power in the session's config (default: the preset's, 10);
                           checked against the dongle's GET_INFO range
+  --name <sender>         name POST /api/messages and scripts' radio.say() send as when
+                          none is given (default DongLoRa)
   --preset <id>           config the server's session asks for (default ${DEFAULT_PRESET.id}):
                           ${PRESETS.map((p) => p.id).join(', ')}
   --script <file.js>      run a script against the server's session (repeatable); it runs
@@ -75,6 +77,7 @@ function options() {
         'allow-tx': { type: 'boolean', default: false },
         preset: { type: 'string', default: DEFAULT_PRESET.id },
         'tx-power': { type: 'string' },
+        name: { type: 'string', default: 'DongLoRa' },
         script: { type: 'string', multiple: true, default: [] },
         help: { type: 'boolean', short: 'h', default: false },
       },
@@ -105,6 +108,7 @@ function options() {
     preset,
     config: { ...preset.config, txPowerDbm: txPower },
     scripts: parsed.script,
+    sender: parsed.name.trim(),
   }
 }
 
@@ -151,7 +155,7 @@ function refuse(res: ServerResponse, status: number, error: string): void {
 const store = new RadioStore()
 store.setRequested(opts.config)
 store.on('log', (e) => log(`radio: ${e.text}`))
-const listScripts = opts.scripts.length ? startServerScripts(store, opts.scripts, opts.allowTx, log) : () => []
+const listScripts = opts.scripts.length ? startServerScripts(store, opts.scripts, opts.allowTx, opts.sender, log) : () => []
 
 let relays = 0
 const startedAt = Date.now()
@@ -225,7 +229,7 @@ const http = createServer((req, res) => {
       res.writeHead(204)
       return void res.end()
     }
-    return void handleApi(req, res, url, { store, facts, scripts: listScripts })
+    return void handleApi(req, res, url, { store, facts, scripts: listScripts, sender: opts.sender })
   }
   if (req.method !== 'GET' && req.method !== 'HEAD') return refuse(res, 405, 'the console is read-only; the API is under /api')
   void serveStatic(url, res, req.method === 'HEAD')

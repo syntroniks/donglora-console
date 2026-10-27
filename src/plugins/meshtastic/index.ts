@@ -1,11 +1,15 @@
 // Meshtastic as a protocol plugin, receive only: the default channel of every modem preset, decoded with the
 // well-known default key, and what node info, positions, telemetry and text posts tell about nodes and messages.
 
-import type { RxPacket } from '../../protocol/messages.ts'
-import type { Learned, MessageSighting, NodeSighting, PacketDecode, ProtocolPlugin } from '../types.ts'
+import { LORA_BANDWIDTHS_KHZ } from '../../protocol/codes.ts'
+import type { LoRaConfig, RxPacket } from '../../protocol/messages.ts'
+import type { Composer, Learned, MessageSighting, NodeSighting, PacketDecode, ProtocolPlugin } from '../types.ts'
+import { encodeText } from './apps.ts'
+import { PortNum } from './codes.ts'
+import { DEFAULT_CHANNELS } from './crypto.ts'
 import { decodeMeshtastic, type MeshtasticDecode } from './decode.ts'
-import { BROADCAST, nodeId } from './packet.ts'
-import { MESHTASTIC_PRESETS, MESHTASTIC_SYNC_WORD } from './presets.ts'
+import { BROADCAST, encodeMeshtasticPacket, nodeId } from './packet.ts'
+import { MESHTASTIC_PRESETS, MESHTASTIC_SYNC_WORD, MODEM_PRESETS } from './presets.ts'
 
 export * from './apps.ts'
 export * from './codes.ts'
@@ -51,10 +55,48 @@ function learn(decode: PacketDecode, rx: RxPacket): Learned {
   return out
 }
 
+/** Room for text in one packet: the firmware's 233-byte Data payload, less the header and protobuf framing. */
+const MAX_TEXT_BYTES = 200
+const HOP_LIMIT = 3
+
+/**
+ * A stable node number for a sender name (FNV-1a), so the same name always sends as the same !node. Other
+ * radios learn names from NODEINFO, which this doesn't send, so they show the !node id.
+ */
+export function nodeNumFor(name: string): number {
+  let h = 0x811c9dc5
+  for (const b of new TextEncoder().encode(name)) h = Math.imul(h ^ b, 0x01000193) >>> 0
+  // 0-3 are reserved and 0xffffffff is broadcast
+  return h < 4 || h === BROADCAST ? (h ^ 0x5a5a5a5a) >>> 0 : h
+}
+
+/** The default channel of the modem preset this config uses first, then the rest. */
+function channelsFor(config: LoRaConfig): string[] {
+  const bwKhz = LORA_BANDWIDTHS_KHZ[config.bw]
+  const matching = Object.values(MODEM_PRESETS).find((m) => m.sf === config.sf && m.bwKhz === bwKhz)?.name
+  const names = DEFAULT_CHANNELS.map((c) => c.name)
+  return matching ? [matching, ...names.filter((n) => n !== matching)] : names
+}
+
+/** Text broadcast on a default channel, with the default key, from the sender's derived node number. */
+const compose: Composer = {
+  channels: channelsFor,
+  maxTextBytes: () => MAX_TEXT_BYTES,
+  senderProblem: (sender) => (!sender.trim() ? 'set a sender name: it picks the node id this console sends as' : undefined),
+  build({ channel, text, sender }) {
+    const ch = DEFAULT_CHANNELS.find((c) => c.name === channel)
+    if (!ch) throw new Error(`no default Meshtastic channel '${channel}'`)
+    const from = nodeNumFor(sender)
+    const id = (Math.floor(Math.random() * 0xfffffffe) + 1) >>> 0
+    const bytes = encodeMeshtasticPacket({ to: BROADCAST, from, id, hopLimit: HOP_LIMIT, hopStart: HOP_LIMIT, channel: ch.hash, key: ch.key, portnum: PortNum.Text, payload: encodeText(text) })
+    return { bytes, message: { channel, sender: nodeId(from), text, hops: 0, key: `${from}/${id}` } }
+  },
+}
+
 export const meshtasticPlugin: ProtocolPlugin = {
   id: 'meshtastic',
   name: 'Meshtastic',
-  description: 'Meshtastic mesh packets on the default channels: text, positions, node info, telemetry, routing and traceroutes. Receive only',
+  description: 'Meshtastic mesh packets on the default channels: text, positions, node info, telemetry, routing and traceroutes; sends channel text',
   presets: MESHTASTIC_PRESETS,
   stages: [
     { stage: 'header', label: 'Header (truncated)' },
@@ -66,4 +108,5 @@ export const meshtasticPlugin: ProtocolPlugin = {
   claims: (config) => config.syncWord === MESHTASTIC_SYNC_WORD,
   decode: (raw) => decodeMeshtastic(raw),
   learn,
+  compose,
 }

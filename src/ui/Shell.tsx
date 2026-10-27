@@ -13,7 +13,7 @@ import { matchPreset, pluginById, PLUGINS, presetById, PRESETS } from '../plugin
 import { FRONT_END_ROWS, FRONT_END_SOURCE_LABELS, frontEndFor, TX_POWER_MEANING_LABELS, txPowerMeaning } from '../radio/frontEnd.ts'
 import { MEDIAN_WINDOW, NOISE_SOURCE_LABELS, NUM_NOISE_FLOOR_SAMPLES } from '../radio/noiseFloor.ts'
 import { scripts } from './scripts.ts'
-import { radioStatusAvailable, store, type PacketEntry } from './store.ts'
+import { radioStatusAvailable, savedSender, store, type PacketEntry } from './store.ts'
 import { ago, level, plural, time } from './format.ts'
 
 const C = {
@@ -237,6 +237,13 @@ export function Shell() {
           if (cmd === 'run') scripts.run(x.id)
           else scripts.stop(x.id)
           return
+        }
+        case 'say': {
+          const text = line.replace(/^\/?say\s*/, '')
+          if (!text) return say(C.err('usage: /say <text>'))
+          if (!savedSender()) return say(C.err('no sender name yet: set one in the Messages view'))
+          const { done, message } = await store.sendMessage({ text, sender: savedSender() })
+          return say(done.result === 0 ? `${C.ok('sent')} to ${message.channel} as ${message.sender}` : C.warn(`not sent: ${TX_RESULT_NAMES[done.result] ?? done.result}`))
         }
         case 'tx': {
           if (!s.txArmed) return say(C.err('TX is not armed. Arm it on the Radio tab first.'))

@@ -5,7 +5,7 @@
 import { EXAMPLES, type ScriptExample } from '../scripts/examples.ts'
 import { ScriptHost, type HostChannel, type ScriptLine, type ScriptSpec } from '../scripts/host.ts'
 import type { HostToScript, ScriptToHost } from '../scripts/messages.ts'
-import { store } from './store.ts'
+import { savedSender, store } from './store.ts'
 
 export interface SavedScript extends ScriptSpec {
   /** start whenever the console connects to a dongle */
@@ -84,6 +84,7 @@ export class ScriptsStore {
         },
       },
       exited: () => this.patch({ running: this.host.runningIds() }),
+      defaultSender: savedSender,
     })
     let was = store.getState().status
     store.subscribe(() => {

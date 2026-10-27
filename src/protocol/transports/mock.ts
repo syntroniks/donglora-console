@@ -138,7 +138,7 @@ export class MockDongLoRaTransport implements Transport {
   private readonly bootAt = Date.now()
   private timers = new Set<ReturnType<typeof setTimeout>>()
   private inactivity: ReturnType<typeof setTimeout> | null = null
-  private txQueue: { tag: number; len: number }[] = []
+  private txQueue: { tag: number; len: number; data: Uint8Array }[] = []
   private txBusy = false
   readonly info: DeviceInfo
 
@@ -267,7 +267,7 @@ export class MockDongLoRaTransport implements Transport {
         const len = p.length - 1
         if (len < 1 || len > this.info.maxPayloadBytes) return this.err(tag, ErrCode.Length)
         if (this.txQueue.length >= this.info.txQueueCapacity) return this.err(tag, ErrCode.Busy)
-        this.txQueue.push({ tag, len })
+        this.txQueue.push({ tag, len, data: p.slice(1) })
         this.ok(tag)
         return this.pumpTx()
       }
@@ -300,8 +300,41 @@ export class MockDongLoRaTransport implements Transport {
       if (this.txQueue[0] !== job) return // cancelled or timed out meanwhile
       this.txQueue.shift()
       this.send(MsgType.TxDone, job.tag, new ByteWriter().u8(busy ? TxResult.ChannelBusy : TxResult.Transmitted).u32(air).toBytes())
+      if (!busy) this.echo(job.data)
       this.pumpTx()
     })
+  }
+
+  /**
+   * The simulated mesh repeating what we sent: one to three copies a second or two later, each one hop
+   * further along, the way repeaters flood a channel post or a Meshtastic broadcast.
+   */
+  private echo(data: Uint8Array): void {
+    const meshcoreFlood = this.onMesh() && data.length > 2 && (data[0] & 0x03) === 1
+    const meshtastic = this.onMeshtastic() && data.length > 16
+    if (!meshcoreFlood && !meshtastic) return
+    const copies = 1 + Math.floor(Math.random() * 3)
+    for (let i = 0; i < copies; i++) {
+      this.later(800 + Math.random() * 1700, () => {
+        if (!this.receiving) return
+        let copy: Uint8Array
+        if (meshcoreFlood) {
+          // header, path length (1-byte hashes), path, payload: a repeater appends its hash to the path
+          const hops = data[1] & 0x3f
+          copy = new Uint8Array(data.length + 1)
+          copy.set(data.subarray(0, 2 + hops))
+          copy[1] = (data[1] & 0xc0) | (hops + 1)
+          copy[2 + hops] = Math.floor(Math.random() * 256)
+          copy.set(data.subarray(2 + hops), 3 + hops)
+        } else {
+          // one hop used up, relayed by someone else
+          copy = data.slice()
+          copy[12] = (copy[12] & ~0x07) | Math.max(0, (copy[12] & 0x07) - 1)
+          copy[15] = Math.floor(Math.random() * 256)
+        }
+        this.emitRx(copy, true)
+      })
+    }
   }
 
   /** What RADIO_STATUS reads now. RSSI only in continuous RX, now and then in the middle of a packet. */

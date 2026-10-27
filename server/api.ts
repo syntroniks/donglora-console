@@ -6,7 +6,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { fromHex } from '../src/protocol/bytes.ts'
 import { DongLoRaError, TimeoutError } from '../src/protocol/client.ts'
 import { matchPreset, PLUGINS, PRESETS } from '../src/plugins/index.ts'
-import { radioStatusAvailable, type RadioStore } from '../src/radio/store.ts'
+import { radioStatusAvailable, SendError, type RadioStore } from '../src/radio/store.ts'
 import { ConfigInputError, configFromInput, summarize } from '../src/radio/summary.ts'
 import { toJson } from './json.ts'
 import type { ServerScript } from './scripts.ts'
@@ -26,6 +26,8 @@ export interface ApiContext {
   facts: () => ServerFacts
   /** scripts started with --script, with their recent output */
   scripts: () => ServerScript[]
+  /** default sender name for POST /api/messages (--name) */
+  sender: string
 }
 
 export const ENDPOINTS: { method: string; path: string; summary: string }[] = [
@@ -42,6 +44,7 @@ export const ENDPOINTS: { method: string; path: string; summary: string }[] = [
   { method: 'GET', path: '/api/packets', summary: 'received packets with their plugin decode, newest first; ?limit=50&after=<id>&protocol=<plugin>' },
   { method: 'GET', path: '/api/nodes', summary: 'nodes the plugins learned about, most recent first; ?protocol=<plugin>' },
   { method: 'GET', path: '/api/messages', summary: 'channel messages, newest first; ?limit=100&protocol=<plugin>' },
+  { method: 'POST', path: '/api/messages', summary: 'post {"text", "channel"?, "sender"?, "protocol"?} through the plugin for the radio config; only with --allow-tx' },
   { method: 'GET', path: '/api/radio', summary: 'last RADIO_STATUS (firmware 1.6.0), noise floor, keepalive health' },
   { method: 'GET', path: '/api/link-errors', summary: 'frames that failed to decode or fit, newest first; ?limit=100' },
   { method: 'GET', path: '/api/log', summary: 'session log, newest first' },
@@ -138,6 +141,15 @@ export async function handleApi(req: IncomingMessage, res: ServerResponse, url: 
         const done = await store.transmit(fromHex(hex))
         return send(res, 200, done)
       }
+      case 'POST /api/messages': {
+        if (!ctx.facts().allowTx) throw new HttpError(403, 'TX is off: start the server with --allow-tx')
+        const body = await readJson(req)
+        const str = (k: string) => (typeof body[k] === 'string' ? (body[k] as string) : undefined)
+        if (!str('text')) throw new HttpError(400, 'body needs "text"')
+        if (!store.getState().txArmed) store.armTx(true)
+        const sent = await store.sendMessage({ text: str('text')!, sender: str('sender') ?? ctx.sender, channel: str('channel'), protocol: str('protocol') })
+        return send(res, 200, sent)
+      }
       case 'GET /api/scripts':
         return send(res, 200, ctx.scripts())
       case 'GET /api/events':
@@ -155,7 +167,7 @@ export async function handleApi(req: IncomingMessage, res: ServerResponse, url: 
 
 function errorStatus(err: unknown): [number, string] {
   if (err instanceof HttpError) return [err.status, err.message]
-  if (err instanceof ConfigInputError) return [400, err.message]
+  if (err instanceof ConfigInputError || err instanceof SendError) return [400, err.message]
   if (err instanceof DongLoRaError) return [502, err.message] // the dongle (or mux) refused it
   if (err instanceof TimeoutError) return [504, err.message]
   const message = err instanceof Error ? err.message : String(err)

@@ -4,10 +4,10 @@
 
 import { DongLoRaClient, type KeepaliveHealth, type LinkError, type LinkErrorKind, type Transport } from '../protocol/client.ts'
 import type { Frame } from '../protocol/framing.ts'
-import { Capability, SET_CONFIG_RESULT_NAMES } from '../protocol/codes.ts'
+import { Capability, SET_CONFIG_RESULT_NAMES, TX_RESULT_NAMES, TxResult } from '../protocol/codes.ts'
 import { hasCapability, type DeviceInfo, type LoRaConfig, type RadioStatus, type RxPacket, type SetConfigReply, type TxDone } from '../protocol/messages.ts'
 import { validateConfig } from '../protocol/lora.ts'
-import { decodePacket, DEFAULT_PRESET, pluginById, type DecodeStatus, type MessageSighting, type NodeSighting, type PacketDecode } from '../plugins/index.ts'
+import { decodePacket, DEFAULT_PRESET, pluginById, pluginsFor, type DecodeStatus, type MessageSighting, type NodeSighting, type PacketDecode } from '../plugins/index.ts'
 import { NoiseFloorTracker, type NoiseFloorState } from '../radio/noiseFloor.ts'
 
 export type Status = 'disconnected' | 'connecting' | 'connected'
@@ -73,11 +73,29 @@ export interface Message {
   sentAt?: number
   /** of the first copy heard */
   hops?: number
-  rssi: number
-  snr: number
-  /** copies heard: a flooded message arrives once per path */
+  /** of the first copy heard; not set for a message this console sent */
+  rssi?: number
+  snr?: number
+  /** copies heard: a flooded message arrives once per path. For a sent one, the copies heard back. */
   copies: number
   key?: string
+  /** this console sent it; `tx` says how that went */
+  outgoing?: boolean
+  tx?: { result: number; airtimeUs: number }
+  /** heard as another client's transmission on this dongle (through mux), not over the air */
+  local?: boolean
+}
+
+/** A message that can't be sent as given: no plugin for the config, a bad channel or sender, too long. */
+export class SendError extends Error {}
+
+export interface SendInput {
+  /** plugin id; default: the first plugin that claims the radio config and can send */
+  protocol?: string
+  /** default: the plugin's best channel for the radio config */
+  channel?: string
+  text: string
+  sender: string
 }
 
 export interface SessionEvent {
@@ -226,6 +244,8 @@ function mergeNode(prev: HeardNode | undefined, s: NodeSighting, protocol: strin
   }
 }
 
+const utf8Length = (s: string) => new TextEncoder().encode(s).length
+
 const messageOf = (m: MessageSighting, p: PacketEntry, protocol: string, id: number): Message => ({
   id,
   at: p.at,
@@ -239,6 +259,7 @@ const messageOf = (m: MessageSighting, p: PacketEntry, protocol: string, id: num
   snr: p.rx.snr,
   copies: 1,
   key: m.key,
+  local: p.rx.origin === 1 || undefined,
 })
 
 export class RadioStore {
@@ -442,6 +463,50 @@ export class RadioStore {
     if (this.state.info && data.length > this.state.info.maxPayloadBytes) throw new Error(`packet is over ${this.state.info.maxPayloadBytes} bytes`)
     this.log(`TX ${data.length} B`, 'warn')
     return c.transmit(data)
+  }
+
+  /**
+   * Post a channel message through the plugin that decodes this radio config. Needs TX armed, like
+   * transmit(): arming is the consent, so this doesn't ask again per message. The sent message joins the
+   * list, and the mesh's copies of it count as heard back.
+   */
+  async sendMessage(input: SendInput): Promise<{ done: TxDone; message: Message }> {
+    const config = this.state.applied?.lora ?? this.state.requested
+    const plugin = input.protocol ? pluginById(input.protocol) : pluginsFor(config).find((p) => p.compose)
+    if (!plugin?.compose) throw new SendError(input.protocol ? `${input.protocol} can't send messages` : 'no plugin that can send claims this radio config: pick a MeshCore or Meshtastic preset')
+    if (!plugin.claims(config)) throw new SendError(`the radio isn't set up for ${plugin.name}: pick a ${plugin.name} preset first`)
+    const compose = plugin.compose
+    const channel = input.channel ?? compose.channels(config)[0]
+    if (!compose.channels(config).includes(channel)) throw new SendError(`${plugin.name} can't post to '${channel}'`)
+    const text = input.text.trim()
+    const sender = input.sender.trim()
+    if (!text) throw new SendError('nothing to send')
+    const problem = compose.senderProblem?.(sender)
+    if (problem) throw new SendError(problem)
+    const max = compose.maxTextBytes(sender)
+    if (utf8Length(text) > max) throw new SendError(`message is ${utf8Length(text)} bytes; ${plugin.name} fits ${max} in one packet`)
+    const composed = compose.build({ channel, text, sender, now: Math.floor(Date.now() / 1000) })
+    const done = await this.transmit(composed.bytes)
+    const m = composed.message
+    const sent = done.result === TxResult.Transmitted
+    const message: Message = {
+      id: this.nextId++,
+      at: Date.now(),
+      protocol: plugin.id,
+      channel: m.channel,
+      sender: m.sender,
+      text: m.text,
+      sentAt: m.sentAt,
+      hops: 0,
+      copies: 0,
+      // only a message that went out can be heard back
+      key: sent ? m.key : undefined,
+      outgoing: true,
+      tx: { result: done.result, airtimeUs: done.airtimeUs },
+    }
+    this.patch((s) => ({ messages: [...s.messages, message].slice(-MESSAGES_MAX) }))
+    this.log(sent ? `sent to ${plugin.name} ${m.channel}: ${text}` : `not sent (${TX_RESULT_NAMES[done.result] ?? done.result}): ${text}`, sent ? 'info' : 'warn')
+    return { done, message }
   }
 
   // ---- incoming ----

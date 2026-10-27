@@ -1,14 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { CAPABILITY_NAMES, MODULATION_NAMES, OWNER_NAMES, RADIO_CHIP_NAMES, SET_CONFIG_RESULT_NAMES } from '../protocol/codes.ts'
+import { CAPABILITY_NAMES, MODULATION_NAMES, OWNER_NAMES, RADIO_CHIP_NAMES, SET_CONFIG_RESULT_NAMES, TX_RESULT_NAMES, TxResult } from '../protocol/codes.ts'
 import { LINK_ERROR_NAMES } from '../protocol/client.ts'
 import { bwKHz, mhz, supportedBws, supportedSfs } from '../protocol/lora.ts'
-import { pluginById, stageLabel } from '../plugins/index.ts'
+import { pluginById, pluginsFor, stageLabel } from '../plugins/index.ts'
 import { TX_POWER_MEANING_LABELS, txPowerMeaning } from '../radio/frontEnd.ts'
 import { MEDIAN_WINDOW, NOISE_SOURCE_LABELS, NUM_NOISE_FLOOR_SAMPLES } from '../radio/noiseFloor.ts'
 import { NoiseChart } from './NoiseChart.tsx'
 import { configRows } from './configRows.ts'
-import { Card, Empty, Rows } from './parts.tsx'
-import { radioStatusAvailable, type RadioState } from './store.ts'
+import { Button, Card, Empty, Rows } from './parts.tsx'
+import { radioStatusAvailable, saveSender, savedSender, store, type Message, type RadioState } from './store.ts'
 import { ago, coords, db, dbm, duration, level, plural, shortKey, time } from './format.ts'
 
 /** re-render every second, for "x ago" and uptime */
@@ -224,26 +224,132 @@ export function Messages({ state }: { state: RadioState }) {
     <div className="channel">
       <div className="thread-head">
         <span className="thread-title">Messages</span>
-        <span className="muted small">read-only · channel text the plugins could decrypt (MeshCore Public, Meshtastic default channels) · senders are unverified</span>
+        <span className="muted small">channel text the plugins can read (MeshCore Public, Meshtastic default channels) · senders are unverified</span>
       </div>
       <div className="thread-list">
         {state.messages.length ? (
-          state.messages.map((m) => (
-            <div key={m.id} className="bubble bubble-in">
-              <div className="bubble-from">{m.sender || <span className="muted">(no sender)</span>} <span className="muted">· {m.channel || '?'} · {protocolName(m.protocol)}</span></div>
-              <div className="bubble-text">{m.text}</div>
-              <div className="bubble-meta">
-                <span>{new Date(m.sentAt ? m.sentAt * 1000 : m.at).toLocaleTimeString([], { hour12: false })}</span>
-                {m.hops !== undefined && <span>{plural(m.hops, 'hop')}</span>}
-                {m.copies > 1 && <span title="the mesh delivered it by several paths">heard {m.copies}×</span>}
-                <span>{level(m.rssi)} dBm · SNR {level(m.snr)}</span>
-              </div>
-            </div>
-          ))
+          state.messages.map((m) => <Bubble key={m.id} m={m} />)
         ) : (
-          <Empty>Channel messages show up here as they’re heard.</Empty>
+          <Empty>Channel messages show up here as they’re heard, and the ones you send.</Empty>
         )}
         <div ref={end} />
+      </div>
+      <Compose state={state} />
+    </div>
+  )
+}
+
+function Bubble({ m }: { m: Message }) {
+  const failed = m.outgoing && m.tx?.result !== TxResult.Transmitted
+  return (
+    <div className={`bubble ${m.outgoing ? 'bubble-out' : 'bubble-in'}${failed ? ' bubble-failed' : ''}`}>
+      <div className="bubble-from">
+        {m.outgoing ? 'you' : m.sender || <span className="muted">(no sender)</span>}
+        <span className="muted"> · {m.channel || '?'} · {protocolName(m.protocol)}{m.local ? ' · this dongle' : ''}</span>
+      </div>
+      <div className="bubble-text">{m.text}</div>
+      <div className="bubble-meta">
+        <span>{new Date(m.sentAt ? m.sentAt * 1000 : m.at).toLocaleTimeString([], { hour12: false })}</span>
+        {m.outgoing ? (
+          <>
+            <span className={failed ? 'err' : undefined}>
+              {failed ? `not sent: ${TX_RESULT_NAMES[m.tx?.result ?? -1]?.toLowerCase().replace('_', ' ') ?? 'failed'}` : `sent as ${m.sender}, ${((m.tx?.airtimeUs ?? 0) / 1000).toFixed(0)} ms on air`}
+            </span>
+            {!failed && <span title="copies of it this radio heard from repeaters">{m.copies ? `heard back ${m.copies}×` : 'not heard back yet'}</span>}
+          </>
+        ) : (
+          <>
+            {m.hops !== undefined && <span>{plural(m.hops, 'hop')}</span>}
+            {m.copies > 1 && <span title="the mesh delivered it by several paths">heard {m.copies}×</span>}
+            {m.rssi !== undefined && <span>{level(m.rssi)} dBm · SNR {level(m.snr ?? 0)}</span>}
+          </>
+        )}
+      </div>
+    </div>
+  )
+}
+
+/**
+ * Posting goes through the plugin that decodes the current radio config. Arming TX (once, with its warning)
+ * is the consent: while armed, messages go out without asking each time, and the bar says where and how loud.
+ */
+function Compose({ state }: { state: RadioState }) {
+  const config = state.applied?.lora ?? state.requested
+  const plugin = pluginsFor(config).find((p) => p.compose)
+  const [sender, setSender] = useState(savedSender)
+  const [text, setText] = useState('')
+  const [picked, setPicked] = useState<string>()
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string>()
+  const connected = state.status === 'connected'
+  if (!plugin?.compose) return <div className="compose muted small">No plugin can send with this radio config. Pick a MeshCore or Meshtastic preset on the Radio tab to post.</div>
+  const channels = plugin.compose.channels(config)
+  const channel = picked && channels.includes(picked) ? picked : channels[0]
+  const max = plugin.compose.maxTextBytes(sender.trim())
+  const used = new TextEncoder().encode(text.trim()).length
+  const senderProblem = plugin.compose.senderProblem?.(sender.trim())
+  const power = `${config.txPowerDbm} dBm, ${TX_POWER_MEANING_LABELS[txPowerMeaning(state.info, state.radioStatus)]}`
+  const where = `${mhz(config.freqHz)} MHz`
+
+  const arm = () => {
+    setError(undefined)
+    const ok = window.confirm(
+      `Arm TX?\n\nMessages you send then go out on ${where} at ${power}, without asking again each time, until you disarm TX on the Radio tab.\n\n` +
+        'The firmware enforces no regulatory limits. You are responsible for being allowed to transmit on this frequency at this power.',
+    )
+    if (!ok) return
+    try {
+      store.armTx(true)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }
+  const send = async () => {
+    setBusy(true)
+    setError(undefined)
+    try {
+      saveSender(sender)
+      const { done } = await store.sendMessage({ protocol: plugin.id, channel, text, sender })
+      if (done.result === TxResult.Transmitted) setText('')
+      else setError(`not sent: ${TX_RESULT_NAMES[done.result] ?? done.result}; try again`)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+  const canSend = connected && state.txArmed && !busy && !!text.trim() && used <= max && !senderProblem
+
+  return (
+    <div className="compose">
+      <div className="compose-row">
+        <select value={channel} onChange={(e) => setPicked(e.target.value)} aria-label="channel" title={`${plugin.name} channel`}>
+          {channels.map((c) => (
+            <option key={c} value={c}>{plugin.name} · {c}</option>
+          ))}
+        </select>
+        <input className="compose-sender" value={sender} onChange={(e) => setSender(e.target.value)} placeholder="your name" aria-label="sender name" spellCheck={false}
+          title={plugin.id === 'meshtastic' ? 'picks the !node id this console sends as' : 'shown with every post'} />
+        <input
+          className="compose-text"
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && canSend) void send()
+          }}
+          placeholder={`message to ${channel}`}
+          aria-label="message"
+        />
+        <span className={`small ${used > max ? 'err' : 'muted'}`} title="UTF-8 bytes of the text, and what one packet carries">{used}/{max}</span>
+        {state.txArmed ? (
+          <Button kind="primary" onClick={() => void send()} disabled={!canSend}>{busy ? 'sending…' : 'Send'}</Button>
+        ) : (
+          <Button onClick={arm} disabled={!connected || !!state.txBlocked} title={state.txBlocked ?? 'TX is off until you arm it'}>Arm TX to send</Button>
+        )}
+      </div>
+      <div className="compose-status small">
+        {!connected ? <span className="muted">not connected</span> : state.txBlocked ? <span className="muted">{state.txBlocked}</span> : state.txArmed ? <span className="err">TX armed · {where} · {power}</span> : <span className="muted">TX is off: arming asks once, then each message sends straight away</span>}
+        {(senderProblem && sender) || error ? <span className="err"> · {error ?? senderProblem}</span> : null}
       </div>
     </div>
   )

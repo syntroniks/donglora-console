@@ -2,10 +2,33 @@
 // posts tell about nodes and messages.
 
 import { PUBLIC_CHANNEL } from '../meshcore/crypto.ts'
+import { groupTextPacket } from '../meshcore/build.ts'
 import { decodeMeshCore, type MeshDecode } from '../meshcore/decode.ts'
 import { MESHCORE_SYNC_WORD, PRESETS } from '../meshcore/presets.ts'
 import type { RxPacket } from '../protocol/messages.ts'
-import type { ByteRegion, DecodeField, Learned, PacketDecode, ProtocolPlugin } from './types.ts'
+import type { ByteRegion, Composer, DecodeField, Learned, PacketDecode, ProtocolPlugin } from './types.ts'
+
+/** MeshCore's MAX_TEXT_LEN: 10 cipher blocks of "sender: text" in a channel post. */
+const MAX_TEXT_LEN = 160
+const utf8Length = (s: string) => new TextEncoder().encode(s).length
+
+/** The key `learn` gives a channel post: the same in every copy repeaters forward. */
+const postKey = (channelHash: number | undefined, timestamp: number | undefined, text: string) => `${channelHash ?? ''}/${timestamp ?? ''}/${text}`
+
+/** Posts on the Public channel, flood-routed, as a companion app sends them (Mesh.cpp createGroupDatagram). */
+const compose: Composer = {
+  channels: () => [PUBLIC_CHANNEL.name],
+  maxTextBytes: (sender) => MAX_TEXT_LEN - utf8Length(`${sender}: `),
+  senderProblem: (sender) => (!sender.trim() ? 'MeshCore shows a sender name with every post; set one' : sender.includes(': ') ? 'a MeshCore sender name can\'t contain ": "' : undefined),
+  build({ channel, text, sender, now }) {
+    if (channel !== PUBLIC_CHANNEL.name) throw new Error(`MeshCore can only post to ${PUBLIC_CHANNEL.name} here`)
+    const full = `${sender}: ${text}`
+    return {
+      bytes: groupTextPacket(PUBLIC_CHANNEL, now, full),
+      message: { channel, sender, text, sentAt: now, hops: 0, key: postKey(PUBLIC_CHANNEL.hash, now, full) },
+    }
+  },
+}
 
 const hex2 = (n: number) => `0x${n.toString(16).padStart(2, '0')}`
 const coords = (lat: number, lon: number) => `${lat.toFixed(5)}, ${lon.toFixed(5)}`
@@ -74,7 +97,7 @@ function learn(decode: PacketDecode): Learned {
   const g = m.group
   if (g?.text !== undefined) {
     // repeaters forward the same payload by different paths: channel, timestamp and text identify it
-    const key = `${g.channelHash ?? ''}/${g.timestamp ?? ''}/${g.text}`
+    const key = postKey(g.channelHash, g.timestamp, g.text)
     out.messages = [{ channel: g.channel ?? '', sender: g.sender ?? '', text: g.body ?? '', sentAt: g.timestamp, hops: m.hops ?? 0, key }]
   }
   return out
@@ -95,6 +118,7 @@ export const meshcorePlugin: ProtocolPlugin = {
     { stage: 'decrypt', label: 'Decrypt / plaintext' },
   ],
   claims: (config) => config.syncWord === MESHCORE_SYNC_WORD,
+  compose,
   decode(raw: Uint8Array, _rx: RxPacket): PacketDecode {
     const m = decodeMeshCore(raw, { channels: [PUBLIC_CHANNEL], verifySignatures: true })
     return { protocol: 'meshcore', status: m.status, summary: m.summary, failure: m.failure, fields: fieldsOf(m), regions: regionsOf(m, raw.length), data: m }

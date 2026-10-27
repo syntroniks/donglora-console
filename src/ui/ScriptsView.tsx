@@ -10,6 +10,7 @@ const API = `radio.state()  info()  config()  setConfig('meshtastic-longfast-us'
 radio.rxStart()  rxStop()  ping()  status()        status() is RADIO_STATUS, firmware 1.6.0
 radio.packets(20)  nodes()  messages(50)  plugins()
 radio.tx(hexOrBytes)       only with "may transmit" ticked and TX armed on the Radio tab
+radio.say(text, { channel, sender })   post a channel message, same rule; sender defaults to the Messages view's name
 on('packet' | 'node' | 'message' | 'link-error' | 'log' | 'connected' | 'disconnected', fn) -> off()
 every(ms, fn) -> cancel()  sleep(ms)  print(...)  warn(...)
 storage.get(key)  storage.set(key, jsonValue)       kept for this script in this browser`

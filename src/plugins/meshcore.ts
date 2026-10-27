@@ -72,7 +72,11 @@ function learn(decode: PacketDecode): Learned {
     out.nodes = [{ id: a.publicKey, name: a.name, kind: a.typeName, hops: m.hops ?? 0, lat: a.hasLocation ? a.lat : undefined, lon: a.hasLocation ? a.lon : undefined }]
   }
   const g = m.group
-  if (g?.text !== undefined) out.messages = [{ channel: g.channel ?? '', sender: g.sender ?? '', text: g.body ?? '', sentAt: g.timestamp, hops: m.hops ?? 0 }]
+  if (g?.text !== undefined) {
+    // repeaters forward the same payload by different paths: channel, timestamp and text identify it
+    const key = `${g.channelHash ?? ''}/${g.timestamp ?? ''}/${g.text}`
+    out.messages = [{ channel: g.channel ?? '', sender: g.sender ?? '', text: g.body ?? '', sentAt: g.timestamp, hops: m.hops ?? 0, key }]
+  }
   return out
 }
 

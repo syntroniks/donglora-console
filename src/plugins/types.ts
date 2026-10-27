@@ -81,6 +81,8 @@ export interface MessageSighting {
   /** sender's clock, unix seconds, when the protocol carries it */
   sentAt?: number
   hops?: number
+  /** the same for every copy of this message the mesh delivers (flood repeats arrive by several paths) */
+  key?: string
 }
 
 export interface Learned {

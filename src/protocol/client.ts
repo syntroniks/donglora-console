@@ -4,11 +4,13 @@
 // and replies are matched by tag. TX finishes in two steps: OK when queued, TX_DONE (same tag) when it
 // has gone out. RX events and async errors carry tag 0.
 //
-// The device drops to UNCONFIGURED after 1000 ms without a frame, so the client owns a keepalive that
-// writes when nothing else has been written for KEEPALIVE_MS: RADIO_STATUS when GET_INFO advertises it
-// (v1.1, capability bit 33), which also samples RSSI and the front end, otherwise PING. Both still succeed
-// after a timeout, so the client also notices gaps in its own writes and probes the session, and on
-// ENOTCONFIGURED it re-sends the last config and restarts RX (§14.2).
+// The device drops to UNCONFIGURED after 1000 ms without a frame, so the client owns a keepalive: a PING
+// whenever nothing else has been written for KEEPALIVE_MS. When GET_INFO advertises RADIO_STATUS (v1.1,
+// capability bit 33) the client also polls it on its own, slower schedule (statusPollMs), for RSSI, the
+// front end and the RX counters. Keeping the two apart matters on firmware 1.6.0, where every command the
+// radio task takes interrupts RX; 1.6.1 answers both without the radio task. PING still succeeds after a
+// timeout, so the client also notices gaps in its own writes and probes the session, and on ENOTCONFIGURED
+// it re-sends the last config and restarts RX (§14.2).
 //
 // Nothing that arrives is dropped quietly: frames that fail to decode, unknown types, async errors and
 // replies nobody is waiting for are all reported as 'linkError'.
@@ -95,10 +97,10 @@ export const LINK_ERROR_NAMES: Record<LinkErrorKind, string> = {
 }
 
 export interface KeepaliveHealth {
-  /** what the keepalive sends: RADIO_STATUS when the device has it, else PING */
-  command: 'PING' | 'RADIO_STATUS'
-  pings: number // keepalives answered, PING or RADIO_STATUS
-  failures: number // keepalives that timed out or failed
+  /** what the keepalive sends; RADIO_STATUS is polled separately */
+  command: 'PING'
+  pings: number // keepalive PINGs answered
+  failures: number // keepalive PINGs that timed out or failed
   lastRttMs?: number
   avgRttMs?: number
   lastOkAt?: number
@@ -131,6 +133,8 @@ export interface ClientOptions {
   timeoutMs?: number
   /** write a keepalive when nothing has been written for this long (§14.2: 500 ms or better) */
   keepaliveMs?: number
+  /** poll RADIO_STATUS this often when the device has it; 0 to never poll */
+  statusPollMs?: number
   ticker?: TickerFactory
 }
 
@@ -156,6 +160,7 @@ export class DongLoRaClient {
   private readonly decoder: FrameDecoder
   private readonly timeoutMs: number
   private readonly keepaliveMs: number
+  private readonly statusPollMs: number
   private readonly tickerFactory: TickerFactory
   private readonly listeners: { [K in keyof ClientEvents]: Set<ClientEvents[K]> } = {
     frameIn: new Set(),
@@ -179,6 +184,8 @@ export class DongLoRaClient {
   private lastWriteAt = 0
   private keepalivesInFlight = 0
   private lastKeepaliveAt = 0
+  private lastStatusPollAt = 0
+  private statusPolling = false
   private radioStatusRefused = false
   private probing = false
   private recovering: Promise<void> | null = null
@@ -197,6 +204,7 @@ export class DongLoRaClient {
     this.transport = transport
     this.timeoutMs = options.timeoutMs ?? 2000
     this.keepaliveMs = options.keepaliveMs ?? 400
+    this.statusPollMs = options.statusPollMs ?? 1000
     this.tickerFactory = options.ticker ?? defaultTicker
     this.decoder = new FrameDecoder((f) => this.onFrameFault(f))
   }
@@ -410,7 +418,7 @@ export class DongLoRaClient {
   /**
    * Instantaneous RSSI, RX gain, front-end state and RX counters (v1.1). Resolves undefined without sending
    * anything when GET_INFO doesn't advertise it, and when the device answers EUNKNOWN_CMD anyway; after
-   * that the keepalive goes back to PING.
+   * that the client stops polling it.
    */
   async radioStatus(): Promise<RadioStatus | undefined> {
     if (!this.radioStatusSupported) return undefined
@@ -420,7 +428,7 @@ export class DongLoRaClient {
     } catch (err) {
       if (!(err instanceof DongLoRaError && err.code === ErrCode.UnknownCmd)) throw err
       this.radioStatusRefused = true
-      this.emit('radioStatusUnsupported', 'GET_INFO advertises RADIO_STATUS, but the device answered EUNKNOWN_CMD; keepalive is back on PING')
+      this.emit('radioStatusUnsupported', 'GET_INFO advertises RADIO_STATUS, but the device answered EUNKNOWN_CMD; no longer polling it')
       return undefined
     }
     const status = this.parse('RADIO_STATUS', payload, parseRadioStatus)
@@ -526,6 +534,21 @@ export class DongLoRaClient {
     if (idle >= this.keepaliveMs && this.keepalivesInFlight < MAX_KEEPALIVES_IN_FLIGHT && Date.now() - this.lastKeepaliveAt >= this.keepaliveMs) {
       void this.keepalive()
     }
+    if (this.statusPollMs > 0 && this.radioStatusSupported && !this.statusPolling && Date.now() - this.lastStatusPollAt >= this.statusPollMs) {
+      void this.pollStatus()
+    }
+  }
+
+  private async pollStatus(): Promise<void> {
+    this.statusPolling = true
+    this.lastStatusPollAt = Date.now()
+    try {
+      await this.radioStatus()
+    } catch {
+      // a lost reply; the next poll tries again
+    } finally {
+      this.statusPolling = false
+    }
   }
 
   private async probe(idleMs: number): Promise<void> {
@@ -541,16 +564,12 @@ export class DongLoRaClient {
     }
   }
 
-  /** RADIO_STATUS stands in for PING when the device has it: any frame resets the inactivity timer. */
   private async keepalive(): Promise<void> {
     this.keepalivesInFlight++
     this.lastKeepaliveAt = Date.now()
-    const status = this.radioStatusSupported
-    this.health.command = status ? 'RADIO_STATUS' : 'PING'
     try {
       const t0 = performance.now()
-      if (status) await this.radioStatus()
-      else await this.command(MsgType.Ping)
+      await this.command(MsgType.Ping)
       const rtt = performance.now() - t0
       this.health.pings++
       this.health.lastRttMs = rtt

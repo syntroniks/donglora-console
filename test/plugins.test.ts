@@ -2,9 +2,10 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { groupTextPacket } from '../src/meshcore/build.ts'
 import { PUBLIC_CHANNEL } from '../src/meshcore/crypto.ts'
 import { decodePacket, DEFAULT_PRESET, matchPreset, PLUGINS, presetById, PRESETS } from '../src/plugins/index.ts'
-import type { RxPacket } from '../src/protocol/messages.ts'
+import { MsgType } from '../src/protocol/codes.ts'
+import { encodeRx, type RxPacket } from '../src/protocol/messages.ts'
 import { MOCK_INFO_1_6, MockDongLoRaTransport } from '../src/protocol/transports/mock.ts'
-import { RadioStore } from '../src/radio/store.ts'
+import { RadioStore, type Message } from '../src/radio/store.ts'
 import { configFromInput } from '../src/radio/summary.ts'
 
 const rx = (data: Uint8Array): RxPacket => ({ rssi: -90, snr: 8, freqErr: 0, timestampUs: 0, crcValid: true, packetsDropped: 0, origin: 0, data })
@@ -64,6 +65,25 @@ describe('plugins through the radio store', () => {
     }
     return store
   }
+
+  it('counts the copies of a flooded message once', async () => {
+    const mock = new MockDongLoRaTransport({ info: MOCK_INFO_1_6 })
+    store = new RadioStore()
+    await store.connectTransport(mock, true)
+    const said: Message[] = []
+    store.on('message', (m) => said.push(m))
+    const send = (mock as unknown as { send(type: number, tag: number, payload: Uint8Array): void }).send.bind(mock)
+    // repeaters forward the same payload by different paths
+    for (const path of [Uint8Array.of(0x11), Uint8Array.of(0x22, 0x33), Uint8Array.of(0x44)]) {
+      send(MsgType.Rx, 0, encodeRx(rx(groupTextPacket(PUBLIC_CHANNEL, 1_700_000_000, 'alice: hello', path))))
+    }
+    send(MsgType.Rx, 0, encodeRx(rx(groupTextPacket(PUBLIC_CHANNEL, 1_700_000_001, 'alice: hello'))))
+    const end = Date.now() + 2000
+    while (store.getState().packets.length < 4 && Date.now() < end) await new Promise((r) => setTimeout(r, 10))
+    const messages = store.getState().messages
+    expect(messages.map((m) => [m.text, m.copies])).toEqual([['hello', 3], ['hello', 1]])
+    expect(said).toHaveLength(2)
+  })
 
   it('MeshCore: nodes from signed adverts, Public channel posts', async () => {
     const s = await listen('meshcore-us', (x) => Object.keys(x.getState().nodes).length >= 2 && x.getState().messages.length >= 1)

@@ -4,7 +4,7 @@
 
 import { DongLoRaClient, type KeepaliveHealth, type LinkError, type LinkErrorKind, type Transport } from '../protocol/client.ts'
 import type { Frame } from '../protocol/framing.ts'
-import { Capability } from '../protocol/codes.ts'
+import { Capability, SET_CONFIG_RESULT_NAMES } from '../protocol/codes.ts'
 import { hasCapability, type DeviceInfo, type LoRaConfig, type RadioStatus, type RxPacket, type SetConfigReply, type TxDone } from '../protocol/messages.ts'
 import { validateConfig } from '../protocol/lora.ts'
 import { decodePacket, DEFAULT_PRESET, pluginById, type DecodeStatus, type MessageSighting, type NodeSighting, type PacketDecode } from '../plugins/index.ts'
@@ -71,9 +71,13 @@ export interface Message {
   text: string
   /** sender's clock, unix seconds, when the protocol carries one */
   sentAt?: number
+  /** of the first copy heard */
   hops?: number
   rssi: number
   snr: number
+  /** copies heard: a flooded message arrives once per path */
+  copies: number
+  key?: string
 }
 
 export interface SessionEvent {
@@ -233,6 +237,8 @@ const messageOf = (m: MessageSighting, p: PacketEntry, protocol: string, id: num
   hops: m.hops,
   rssi: p.rx.rssi,
   snr: p.rx.snr,
+  copies: 1,
+  key: m.key,
 })
 
 export class RadioStore {
@@ -393,7 +399,8 @@ export class RadioStore {
     this.patch({ requested: config })
     const reply = await c.setConfig(config)
     this.patch({ applied: reply, rxOn: false })
-    this.log(`config applied: result ${reply.result === 0 ? 'APPLIED' : reply.result}`)
+    const shared = reply.owner === 2 ? ' (another client set it first; through mux that config stays)' : ''
+    this.log(`config applied: ${SET_CONFIG_RESULT_NAMES[reply.result] ?? `result ${reply.result}`}${shared}`)
     if (wasRx) await this.startRx()
     return reply
   }
@@ -487,8 +494,19 @@ export class RadioStore {
         next.nodes = nodes
       }
       if (learned.messages?.length) {
-        for (const m of learned.messages) said.push(messageOf(m, entry, decode.protocol, this.nextId++))
-        next.messages = [...s.messages, ...said].slice(-MESSAGES_MAX)
+        let messages = s.messages
+        for (const m of learned.messages) {
+          const i = m.key ? messages.findLastIndex((x) => x.protocol === decode.protocol && x.key === m.key) : -1
+          if (i >= 0) {
+            // another copy of a message already heard: count it, don't repeat it
+            messages = messages.with(i, { ...messages[i], copies: messages[i].copies + 1 })
+          } else {
+            const msg = messageOf(m, entry, decode.protocol, this.nextId++)
+            said.push(msg)
+            messages = [...messages, msg]
+          }
+        }
+        next.messages = messages.slice(-MESSAGES_MAX)
       }
       return next
     })

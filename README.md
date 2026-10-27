@@ -171,6 +171,12 @@ error at the top level ends it.
 on the Radio tab; every send is logged. The console server runs scripts with `--script`, each in a worker thread
 against the server's session, starting when it first connects; there `tx()` needs `--allow-tx`. A worker thread can use
 Node's APIs, so only give the server scripts you trust. The server never accepts scripts over HTTP.
+`examples/watchdog.js` is a soak watchdog (packets and RSSI each minute, warnings when the radio looks deaf):
+`pnpm server --script examples/watchdog.js`.
+
+Channel messages are counted once however many copies the mesh delivers: a plugin gives each message a key (MeshCore:
+channel, timestamp and text; Meshtastic: sender and packet id), and repeats raise its *heard n×* count instead. Scripts
+get one `message` event per message; the Packets tab still lists every copy.
 
 ## Safety
 
@@ -230,15 +236,21 @@ ignored):
 | 4 | `fem_flags` u8 | bit 0 FEM powered, bit 1 RX LNA active, bit 2 TX PA enabled (0 = bypass) |
 | 5, 9, 13 | `rx_ok`, `rx_crc_err`, `rx_header_err` u32 | RX counters since device boot |
 
-When GET_INFO has the bit, the keepalive sends RADIO_STATUS instead of PING (see Session handling), and each reply
-feeds the noise floor, the front-end card and the device counters on Overview. `client.radioStatus()` resolves
-`undefined` without sending when the bit is clear, and if the device answers EUNKNOWN_CMD anyway it logs that and
-the keepalive goes back to PING.
+When GET_INFO has the bit, the client polls RADIO_STATUS once a second, separately from the PING keepalive (see
+Session handling), and each reply feeds the noise floor, the front-end card and the device counters on Overview.
+`client.radioStatus()` resolves `undefined` without sending when the bit is clear, and if the device answers
+EUNKNOWN_CMD anyway it logs that and stops polling.
+
+Firmware 1.6.1 answers PING and RADIO_STATUS in its USB task, from a snapshot the radio task keeps: it samples RSSI and
+the RX gain register every 250 ms in continuous RX, so `rssi_inst` is at most that old, and absent when older than 1 s
+or outside RX. On 1.6.0 every command reached the radio task and interrupted its receive loop, and a RADIO_STATUS
+keepalive every 400 ms eventually left a RAK4631 deaf (every radio read zero, no RX); 1.6.1 fixes the underlying
+SPI cancellation too. The console polls slowly either way.
 
 ## Noise floor
 
-With RADIO_STATUS, every keepalive reply that has an `rssi_inst` is a *measured* sample: the SX1262's instantaneous
-RSSI, read about twice a second while the radio is in continuous RX. Overview and `/noise` then show the source as
+With RADIO_STATUS, every reply that has an `rssi_inst` is a *measured* sample: the SX1262's instantaneous RSSI, polled
+once a second while the radio is in continuous RX. Overview and `/noise` then show the source as
 *measured (RADIO_STATUS)* and the chart draws those samples as a line. When they stop (RX off, older firmware) the floor
 falls back to packet estimates after 10 s.
 
@@ -278,20 +290,20 @@ count, no bytes)*. `/stats` prints the counters.
 
 Commands are local; DongLoRa has no CLI. `/help`, `/info` (GET_INFO), `/ping`, `/config` (requested and echoed),
 `/preset <id>` (any plugin preset, or a unique suffix like `us`), `/plugins`, `/rx on|off` (print packets), `/rx start|stop` (RX_START / RX_STOP), `/frames on|all|off` (hex of
-every frame, `all` includes the keepalive PINGs or RADIO_STATUS), `/stats`, `/noise`, `/agc`, `/errors`, `/nodes`,
+every frame, `all` includes the keepalive PINGs and RADIO_STATUS polls), `/stats`, `/noise`, `/agc`, `/errors`, `/nodes`,
 `/scripts`, `/run <script>`, `/stop <script>|all`, `/clear` and `/tx <hex>` (needs TX armed, asks to confirm). Tab completes, arrows walk history, Ctrl-C stops waiting
 for a command.
 
 ## Session handling
 
-The dongle drops to UNCONFIGURED after 1000 ms without a frame from the host. The client owns the keepalive: it writes
-one whenever nothing else has been written for 400 ms, from a Worker timer, which background tabs don't throttle. The
-keepalive is RADIO_STATUS when GET_INFO advertises it (any frame resets the timer) and PING otherwise. It keeps its
-schedule even when earlier replies are missing, so one lost reply can't stall it. Both still succeed after a reset,
-so RX could stop without any error. To catch that, a write gap over 900 ms makes the
+The dongle drops to UNCONFIGURED after 1000 ms without a frame from the host. The client owns the keepalive: a PING
+whenever nothing else has been written for 400 ms, from a Worker timer, which background tabs don't throttle. Any frame
+resets the device's timer, so a RADIO_STATUS poll (once a second, when the firmware has it) also counts. The keepalive
+keeps its schedule even when earlier replies are missing, so one lost reply can't stall it. PING still succeeds after
+a reset, so RX could stop without any error. To catch that, a write gap over 900 ms makes the
 client probe with an RX command. That is a no-op on a live session, and on a reset one it fails with ENOTCONFIGURED.
 On ENOTCONFIGURED the client re-sends the last config and restarts RX if it was on. A TX is never retried. Overview
-shows keepalive round trips, which command the keepalive uses, the longest write gap and sessions lost and restored.
+shows keepalive round trips, the longest write gap and sessions lost and restored.
 
 The connection lives outside React, so StrictMode and Fast Refresh can't open a second port. The session state is a
 `RadioStore` (`src/radio/store.ts`) that doesn't know its transport; the console server runs the same class. The page

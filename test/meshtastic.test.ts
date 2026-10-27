@@ -362,9 +362,10 @@ describe('learn', () => {
   it('learns text posts as messages, keeping direct messages apart', () => {
     expect(learn(packet({ portnum: PortNum.Text, payload: encodeText('hello') }))).toEqual({
       nodes: [{ id: '!a1b2c3d4', hops: 2 }],
-      messages: [{ channel: 'LongFast', sender: '!a1b2c3d4', text: 'hello', hops: 2 }],
+      // the key is the same in every rebroadcast: sender and packet id
+      messages: [{ channel: 'LongFast', sender: '!a1b2c3d4', text: 'hello', hops: 2, key: expect.stringMatching(/^2712847316\/\d+$/) }],
     })
-    expect(learn(packet({ to: BOB, portnum: PortNum.Text, payload: encodeText('hi bob') })).messages).toEqual([{ channel: 'LongFast → !0badf00d', sender: '!a1b2c3d4', text: 'hi bob', hops: 2 }])
+    expect(learn(packet({ to: BOB, portnum: PortNum.Text, payload: encodeText('hi bob') })).messages).toEqual([{ channel: 'LongFast → !0badf00d', sender: '!a1b2c3d4', text: 'hi bob', hops: 2, key: expect.any(String) }])
   })
 
   it('learns nothing from packets it could not decrypt', () => {

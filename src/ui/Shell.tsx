@@ -280,7 +280,7 @@ export function Shell() {
       store.on('linkError', (e) => out(C.err(`[link] ${LINK_ERROR_NAMES[e.kind]}: ${e.reason}`) + C.dim(`  ${toHex(e.bytes.subarray(0, 24), ' ')}${e.bytes.length > 24 ? ' …' : ''}`))),
       store.on('log', (e) => out(e.level === 'info' ? C.dim(`[session] ${e.text}`) : e.level === 'warn' ? C.warn(`[session] ${e.text}`) : C.err(`[session] ${e.text}`))),
       store.on('frameOut', (f) => {
-        // RADIO_STATUS is the keepalive on firmware that has it; a manual /ping is filtered with them
+        // the PING keepalive and RADIO_STATUS polls are filtered together; so is a manual /ping
         const keepalive = f.type === MsgType.Ping || f.type === MsgType.RadioStatus
         if (keepalive) keepaliveTags.add(f.tag)
         if (flags.frames === 'all' || (flags.frames === 'on' && !keepalive)) out(C.dim(`-> ${frameText(f)}`))

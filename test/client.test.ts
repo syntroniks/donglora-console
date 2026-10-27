@@ -4,9 +4,9 @@ import { DongLoRaClient, DongLoRaError, TimeoutError, type LinkError, type Trans
 import { cobsEncode } from '../src/protocol/cobs.ts'
 import { ErrCode, MsgType, TxResult } from '../src/protocol/codes.ts'
 import { encodeFrame, frameBody, FrameDecoder, type Frame } from '../src/protocol/framing.ts'
-import { encodeInfo, encodeRx } from '../src/protocol/messages.ts'
+import { encodeInfo, encodeRadioStatus, encodeRx } from '../src/protocol/messages.ts'
 import type { Ticker, TickerFactory } from '../src/protocol/ticker.ts'
-import { MOCK_INFO, MockDongLoRaTransport } from '../src/protocol/transports/mock.ts'
+import { MOCK_INFO, MOCK_INFO_1_6, MockDongLoRaTransport } from '../src/protocol/transports/mock.ts'
 import { DEFAULT_PRESET } from '../src/meshcore/presets.ts'
 
 /** A transport whose replies the test writes by hand. */
@@ -262,6 +262,34 @@ describe('writes and keepalive', () => {
     tick() // the first PING is still unanswered (its reply was lost): send another anyway
     await vi.advanceTimersByTimeAsync(1)
     expect(t.sent.map((f) => f.type)).toEqual([MsgType.Ping, MsgType.Ping])
+  })
+
+  it('keeps alive with PING and polls RADIO_STATUS on its own schedule', async () => {
+    vi.useFakeTimers()
+    const { t, c, tick } = await scripted({ statusPollMs: 1000 })
+    const info = c.getInfo()
+    await vi.advanceTimersByTimeAsync(1)
+    t.reply(MsgType.Ok, t.sent[0].tag, encodeInfo(MOCK_INFO_1_6))
+    await info
+    expect(c.radioStatusSupported).toBe(true)
+    t.sent.length = 0
+    // the first tick polls RADIO_STATUS (none yet); the keepalive is PING
+    tick()
+    await vi.advanceTimersByTimeAsync(1)
+    expect(t.sent.map((f) => f.type)).toEqual([MsgType.RadioStatus])
+    t.reply(MsgType.Ok, t.sent[0].tag, encodeRadioStatus({ rssiInst: -112, rxGain: 0, femType: 0, femFlags: 0, rxOk: 1, rxCrcErr: 0, rxHeaderErr: 0 }))
+    for (let i = 0; i < 9; i++) {
+      await vi.advanceTimersByTimeAsync(100)
+      tick()
+    }
+    await vi.advanceTimersByTimeAsync(1)
+    // 900 ms later: PINGs only, every 400 ms of quiet; no second RADIO_STATUS yet
+    expect(t.sent.slice(1).map((f) => f.type)).toEqual([MsgType.Ping, MsgType.Ping])
+    await vi.advanceTimersByTimeAsync(150)
+    tick()
+    await vi.advanceTimersByTimeAsync(1)
+    expect(t.sent.filter((f) => f.type === MsgType.RadioStatus)).toHaveLength(2)
+    expect(c.health.command).toBe('PING')
   })
 
   it('keeps the mock configured for 10 s with the real interval ticker', async () => {

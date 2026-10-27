@@ -156,8 +156,8 @@ export function Overview({ state }: { state: RadioState }) {
           <Empty>Starts once connected.</Empty>
         )}
         <p className="muted small">
-          The dongle resets after 1000 ms without a frame. A keepalive goes every 400 ms from a Worker timer, so a background tab keeps it:
-          RADIO_STATUS when the firmware has it (1.6.0), which also samples RSSI and the front end, otherwise PING.
+          The dongle resets after 1000 ms without a frame. A PING goes every 400 ms from a Worker timer, so a background tab keeps it.
+          RADIO_STATUS, when the firmware has it, is polled separately once a second for RSSI, the front end and the counters.
         </p>
       </Card>
       <Card title="Session log">
@@ -235,6 +235,7 @@ export function Messages({ state }: { state: RadioState }) {
               <div className="bubble-meta">
                 <span>{new Date(m.sentAt ? m.sentAt * 1000 : m.at).toLocaleTimeString([], { hour12: false })}</span>
                 {m.hops !== undefined && <span>{plural(m.hops, 'hop')}</span>}
+                {m.copies > 1 && <span title="the mesh delivered it by several paths">heard {m.copies}×</span>}
                 <span>{level(m.rssi)} dBm · SNR {level(m.snr)}</span>
               </div>
             </div>
@@ -330,7 +331,7 @@ function NoiseCard({ state, now }: { state: RadioState; now: number }) {
         <NoiseChart points={state.noiseHistory} measured={state.measuredHistory} />
         {measured ? (
           <p className="note">
-            RADIO_STATUS reads the SX1262’s instantaneous RSSI with every keepalive, about twice a second, in 0.5 dB steps. The floor uses
+            RADIO_STATUS gives the SX1262’s instantaneous RSSI, polled once a second, in 0.5 dB steps. The floor uses
             MeshCore’s method: 64 samples under floor + 14 dB, averaged, clamped at −120 dBm, so readings taken during a packet are left out once
             there is a floor. The Packets table still shows each packet’s own estimate.
           </p>

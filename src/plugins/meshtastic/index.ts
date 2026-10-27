@@ -44,7 +44,8 @@ function learn(decode: PacketDecode, rx: RxPacket): Learned {
   } else if (a?.kind === 'text') {
     // direct messages ride the channel key too; keep them out of the channel's own conversation
     const channel = h.to === BROADCAST ? (m.channel ?? '') : `${m.channel ?? ''} → ${nodeId(h.to)}`
-    const msg: MessageSighting = { channel, sender: nodeId(h.from), text: a.text, hops: m.hops }
+    // the sender's packet id is unique per sender, and the same in every rebroadcast
+    const msg: MessageSighting = { channel, sender: nodeId(h.from), text: a.text, hops: m.hops, key: `${h.from}/${h.id}` }
     out.messages = [msg]
   }
   return out

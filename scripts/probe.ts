@@ -3,7 +3,7 @@
 // GET_INFO, SET_CONFIG with a plugin preset (MeshCore USA/Canada unless --preset), RX_START, then every RX
 // event for N seconds decoded by the plugins (failed ones with their reasons and bytes), then RX_STOP and a
 // summary. It never transmits.
-// When GET_INFO sets capability bit 33 (firmware 1.6.0, protocol v1.1) the keepalive is RADIO_STATUS, and
+// When GET_INFO sets capability bit 33 (firmware 1.6.0, protocol v1.1) the client polls RADIO_STATUS, and
 // once a second the probe prints its instantaneous RSSI, the measured noise floor, the device's RX
 // counters and the front-end state.
 // The port must be a DongLoRa by USB VID:PID (1209:5741, or a known USB-UART bridge).
@@ -63,7 +63,7 @@ const posts: string[] = []
 const noise = new NoiseFloorTracker()
 const noiseEstimates: number[] = []
 
-// RADIO_STATUS, from the keepalive (about twice a second) once RX has started
+// RADIO_STATUS, from the client's once-a-second poll, once RX has started
 let statusSupported = false
 let statusTimer: ReturnType<typeof setInterval> | undefined
 let listening = false
@@ -195,6 +195,6 @@ const same = e && JSON.stringify(e) === JSON.stringify(preset.config)
 console.log(`  ${same ? 'matches the request' : 'DIFFERS from the request'}`)
 await client.rxStart()
 listening = true
-console.log(`RX_START ok, listening ${seconds} s (Ctrl-C to stop early)${statusSupported ? '; RADIO_STATUS is the keepalive, printed once a second' : ''}\n`)
+console.log(`RX_START ok, listening ${seconds} s (Ctrl-C to stop early)${statusSupported ? '; RADIO_STATUS is polled and printed once a second' : ''}\n`)
 if (statusSupported) statusTimer = setInterval(printStatus, 1000)
 setTimeout(() => void stop(), seconds * 1000)

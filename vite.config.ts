@@ -7,6 +7,8 @@ const serverProxy = {
 }
 
 export default defineConfig({
+  // relative asset paths, so the build works under any path (GitHub Pages serves it at /donglora-console/)
+  base: './',
   plugins: [react()],
   // 5173 belongs to meshcore-console. /api and /ws go to the console server (pnpm server) on 5742, so
   // the page reaches it on its own origin.

@@ -300,7 +300,10 @@ export class MockDongLoRaTransport implements Transport {
       if (this.txQueue[0] !== job) return // cancelled or timed out meanwhile
       this.txQueue.shift()
       this.send(MsgType.TxDone, job.tag, new ByteWriter().u8(busy ? TxResult.ChannelBusy : TxResult.Transmitted).u32(air).toBytes())
-      if (!busy) this.echo(job.data)
+      if (!busy) {
+        this.transmitted.push(job.data)
+        this.echo(job.data)
+      }
       this.pumpTx()
     })
   }
@@ -398,6 +401,15 @@ export class MockDongLoRaTransport implements Transport {
     if (!this.receiving) return false
     return this.emitRx(this.packet(kind), kind !== 'crc-fail')
   }
+
+  /** Emit these exact bytes as an RX event now, for tests. False when the radio isn't receiving. */
+  injectRaw(data: Uint8Array, crcValid = true): boolean {
+    if (!this.receiving) return false
+    return this.emitRx(data, crcValid)
+  }
+
+  /** Every packet this radio put on the air, in order (a TX that found the channel busy isn't one). */
+  readonly transmitted: Uint8Array[] = []
 
   private emitRx(data: Uint8Array, crcValid: boolean): boolean {
     this.drift(0.8)

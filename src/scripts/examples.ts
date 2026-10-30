@@ -1,4 +1,7 @@
-// Starter scripts offered in the Scripts tab. None of them transmits.
+// Starter scripts offered in the Scripts tab. Only the repeater transmits, and then only once "may transmit" is ticked.
+
+// the same file runs on the console server: pnpm server --allow-tx --script examples/meshcore-repeater.js
+import meshcoreRepeater from '../../examples/meshcore-repeater.js?raw'
 
 export interface ScriptExample {
   name: string
@@ -55,6 +58,11 @@ async function hop() {
 await hop()
 every(5 * 60_000, hop)
 `,
+  },
+  {
+    name: 'MeshCore repeater',
+    description: 'forward MeshCore floods, direct routes and traces like a firmware repeater (transmits: tick “may transmit”, arm TX)',
+    source: meshcoreRepeater,
   },
   {
     name: 'Message tally',

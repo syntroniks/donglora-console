@@ -196,6 +196,16 @@ Node's APIs, so only give the server scripts you trust. The server never accepts
 `examples/watchdog.js` is a soak watchdog (packets and RSSI each minute, warnings when the radio looks deaf):
 `pnpm server --script examples/watchdog.js`.
 
+`examples/meshcore-repeater.js` (also the *MeshCore repeater* example on the Scripts tab) makes the dongle a MeshCore
+repeater, forwarding the way MeshCore's own `simple_repeater` does: it needs *may transmit* and armed TX, or
+`pnpm server --allow-tx --script examples/meshcore-repeater.js`. A flood packet is forwarded once, with the node's hash
+added to its path after a random delay (up to 5 × airtime × `TX_DELAY_FACTOR`), unless it is past `FLOOD_MAX` hops
+(adverts: `FLOOD_MAX_ADVERT`), already passes through this node too often, is an advert with a bad signature, or is
+region-scoped (`ALLOW_SCOPED`). A direct packet is forwarded only when the node's hash is next on its path, and a trace
+gets this hop's SNR added. It stays under `DUTY_CYCLE_MAX` of airtime an hour. It makes a node ID once and keeps it
+(`NODE_ID` takes the start of a real repeater's public key instead). It only forwards: no adverts of its own (they need
+the Ed25519 key, which a script can't use), no replies to requests, no remote CLI, no region list.
+
 Channel messages are counted once however many copies the mesh delivers: a plugin gives each message a key (MeshCore:
 channel, timestamp and text; Meshtastic: sender and packet id), and repeats raise its *heard n×* count instead. Scripts
 get one `message` event per message; the Packets tab still lists every copy.

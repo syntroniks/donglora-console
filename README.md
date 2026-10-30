@@ -281,6 +281,17 @@ or outside RX. On 1.6.0 every command reached the radio task and interrupted its
 keepalive every 400 ms eventually left a RAK4631 deaf (every radio read zero, no RX); 1.6.1 fixes the underlying
 SPI cancellation too. The console polls slowly either way.
 
+A radio that answers every SPI read with zeros still looks healthy to the host: commands return OK, nothing times out,
+and RSSI reads exactly 0 dBm. Firmware that appends the *self-diagnostics* block to RADIO_STATUS (17 bytes at offset 17,
+see PROTOCOL.md §6.11) notices it from the chip's status byte and recovers the radio itself, in steps: reset the SPI
+peripheral, reset the radio chip, cut its supply (RAK4631). None of them takes the dongle off USB. The block also names
+the build (git commit) and counts dropped SPI transfers, zero-status samples and recovery steps. The console shows
+them on Overview under *Radio counters*, logs each recovery step, and sends the config and RX start again once the
+firmware has reset the radio chip (it comes back unconfigured). If the dongle does drop off USB (a replug), the page
+reopens the port it was given when the device returns, with the same config, no click needed. On firmware without the
+block, an RSSI of exactly 0 dBm is still flagged and left out of the noise floor, but only unplugging the dongle brings
+the radio back. `pnpm probe` prints the same block as `SPI link`.
+
 ## Noise floor
 
 With RADIO_STATUS, every reply that has an `rssi_inst` is a *measured* sample: the SX1262's instantaneous RSSI, polled

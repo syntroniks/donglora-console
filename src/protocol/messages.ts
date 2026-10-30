@@ -69,10 +69,32 @@ export interface RadioStatus {
   rxOk: number // packets with a good CRC
   rxCrcErr: number // packets with a bad CRC, delivered as RX events with crc_valid = 0
   rxHeaderErr: number // LoRa header errors, never delivered
+  /** firmware self-diagnostics appended to the payload; absent from firmware that doesn't send them */
+  diag?: RadioDiag
 }
+
+/** The block a device may append to RADIO_STATUS at offset 17 (PROTOCOL.md §6.11): which build this is and how the SPI link is doing. */
+export interface RadioDiag {
+  /** first four bytes of the firmware's git commit; 0 for a build without git metadata */
+  buildId: number
+  /** built from a tree with uncommitted changes */
+  buildDirty: boolean
+  /** radio SPI transfers dropped before they finished, since boot */
+  spiCancels: number
+  /** health samples whose status byte no working SX126x reports (eg. all zeros), since boot */
+  spiZeroReads: number
+  /** recovery steps the firmware took on a wedged radio, since boot */
+  wedgeRecoveries: number
+  /** step the current wedge has reached: 0 healthy, then WEDGE_STAGE_NAMES */
+  wedgeStage: number
+}
+
+/** Recovery steps in the order the firmware tries them; index = RadioDiag.wedgeStage. */
+export const WEDGE_STAGE_NAMES = ['healthy', 'SPI peripheral reset', 'radio reset', 'radio power cycle'] as const
 
 export const LORA_PARAMS_LEN = 15
 export const RADIO_STATUS_LEN = 17
+export const RADIO_DIAG_LEN = 16
 /** rssi_inst when the radio isn't in continuous RX (i16::MIN) */
 export const RSSI_NOT_AVAILABLE = -0x8000
 
@@ -187,7 +209,7 @@ export function parseTxDone(p: Uint8Array): TxDone {
 export function parseRadioStatus(p: Uint8Array): RadioStatus {
   const r = new ByteReader(p)
   const raw = r.i16()
-  return {
+  const status: RadioStatus = {
     rssiInst: raw === RSSI_NOT_AVAILABLE ? null : raw / 10,
     rxGain: r.u8(),
     femType: r.u8(),
@@ -196,13 +218,29 @@ export function parseRadioStatus(p: Uint8Array): RadioStatus {
     rxCrcErr: r.u32(),
     rxHeaderErr: r.u32(),
   }
+  // a block cut short is ignored, not guessed at; longer payloads from later versions are fine
+  if (r.remaining >= RADIO_DIAG_LEN) {
+    const buildId = r.u32()
+    const flags = r.u8()
+    status.diag = {
+      buildId,
+      buildDirty: (flags & 1) !== 0,
+      spiCancels: r.u32(),
+      spiZeroReads: r.u32(),
+      wedgeRecoveries: r.u16(),
+      wedgeStage: r.u8(),
+    }
+  }
+  return status
 }
 
 export function encodeRadioStatus(s: RadioStatus): Uint8Array {
-  return new ByteWriter()
+  const w = new ByteWriter()
     .u16(s.rssiInst === null ? RSSI_NOT_AVAILABLE : Math.round(s.rssiInst * 10)).u8(s.rxGain).u8(s.femType).u8(s.femFlags)
     .u32(s.rxOk).u32(s.rxCrcErr).u32(s.rxHeaderErr)
-    .toBytes()
+  const d = s.diag
+  if (d) w.u32(d.buildId).u8(d.buildDirty ? 1 : 0).u32(d.spiCancels).u32(d.spiZeroReads).u16(d.wedgeRecoveries).u8(d.wedgeStage)
+  return w.toBytes()
 }
 
 export function parseErr(p: Uint8Array): number {

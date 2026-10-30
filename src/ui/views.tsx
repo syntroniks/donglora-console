@@ -8,7 +8,8 @@ import { MEDIAN_WINDOW, NOISE_SOURCE_LABELS, NUM_NOISE_FLOOR_SAMPLES } from '../
 import { NoiseChart } from './NoiseChart.tsx'
 import { configRows } from './configRows.ts'
 import { Button, Card, Empty, Rows } from './parts.tsx'
-import { radioReadsZero, radioStatusAvailable, saveSender, savedSender, store, type Message, type RadioState } from './store.ts'
+import { radioWedged, radioStatusAvailable, saveSender, savedSender, store, type Message, type RadioState } from './store.ts'
+import { buildLabel, stageName } from '../radio/wedge.ts'
 import { ago, coords, db, dbm, duration, level, plural, shortKey, time } from './format.ts'
 
 /** re-render every second, for "x ago" and uptime */
@@ -390,6 +391,15 @@ function CountersCard({ state, now }: { state: RadioState; now: number }) {
                 ),
               },
               { label: 'Header errors', value: counter(s.rxHeaderErr, b?.rxHeaderErr, true) },
+              ...(s.diag
+                ? [
+                    { label: 'Firmware build', value: buildLabel(s.diag) },
+                    { label: 'SPI link', value: s.diag.wedgeStage ? <span className="err">wedged, at “{stageName(s.diag.wedgeStage)}”</span> : 'healthy' },
+                    { label: 'Dropped SPI transfers', value: counter(s.diag.spiCancels, b?.diag?.spiCancels, true) },
+                    { label: 'Zero-status samples', value: counter(s.diag.spiZeroReads, b?.diag?.spiZeroReads, true) },
+                    { label: 'Recovery steps', value: counter(s.diag.wedgeRecoveries, b?.diag?.wedgeRecoveries, true) },
+                  ]
+                : []),
               { label: 'Updated', value: ago(state.radioStatusAt, now) },
             ]}
           />
@@ -434,10 +444,19 @@ function NoiseCard({ state, now }: { state: RadioState; now: number }) {
               : []),
           ]}
         />
-        {radioReadsZero(rs) && (
+        {radioWedged(rs) && (
           <p className="caveat">
-            RSSI is exactly 0 dBm, which is what the radio’s registers read as when it answers every SPI read with zeros.
-            The radio is likely wedged and deaf, so these readings are left out of the floor. Unplug and replug the dongle.
+            {rs?.diag ? (
+              <>
+                The radio is answering SPI reads with zeros, so it is deaf, and these readings are left out of the floor. The firmware is
+                resetting it in steps; it has reached “{stageName(rs.diag.wedgeStage)}”. If that doesn’t bring it back, unplug and replug the dongle.
+              </>
+            ) : (
+              <>
+                RSSI is exactly 0 dBm, which is what the radio’s registers read as when it answers every SPI read with zeros.
+                The radio is likely wedged and deaf, so these readings are left out of the floor. This firmware can’t reset it: unplug and replug the dongle.
+              </>
+            )}
           </p>
         )}
         <NoiseChart points={state.noiseHistory} measured={state.measuredHistory} />

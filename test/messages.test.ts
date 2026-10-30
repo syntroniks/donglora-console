@@ -3,9 +3,11 @@ import { fromHex, toHex } from '../src/protocol/bytes.ts'
 import { airtimeUs, ldro, validateConfig } from '../src/protocol/lora.ts'
 import {
   encodeInfo,
+  encodeRadioStatus,
   encodeRx,
   parseErr,
   parseInfo,
+  parseRadioStatus,
   parseRx,
   parseSetConfigReply,
   parseTxDone,
@@ -131,5 +133,33 @@ describe('airtime', () => {
   it('turns on LDRO when symbols pass 16 ms', () => {
     expect(ldro({ ...eu868, sf: 10 })).toBe(false)
     expect(ldro({ ...eu868, sf: 11 })).toBe(true) // 2048 / 125 kHz = 16.4 ms
+  })
+})
+
+describe('RADIO_STATUS self-diagnostics', () => {
+  const base = { rssiInst: -112.5, rxGain: 0, femType: 0xff, femFlags: 0, rxOk: 3, rxCrcErr: 2, rxHeaderErr: 1 }
+  const diag = { buildId: 0x5f87827e, buildDirty: true, spiCancels: 7, spiZeroReads: 0x01020304, wedgeRecoveries: 513, wedgeStage: 2 }
+
+  it('round-trips with and without the diagnostics block', () => {
+    expect(encodeRadioStatus(base)).toHaveLength(17)
+    expect(parseRadioStatus(encodeRadioStatus(base))).toEqual(base)
+    const full = encodeRadioStatus({ ...base, diag })
+    expect(full).toHaveLength(33)
+    expect(parseRadioStatus(full)).toEqual({ ...base, diag })
+  })
+
+  it('reads the block at the offsets the protocol gives', () => {
+    const bytes = encodeRadioStatus({ ...base, diag })
+    // build_id little-endian at 17, flags at 21, wedge_recoveries u16 at 30, stage at 32
+    expect([...bytes.subarray(17, 21)]).toEqual([0x7e, 0x82, 0x87, 0x5f])
+    expect(bytes[21]).toBe(1)
+    expect([...bytes.subarray(30, 32)]).toEqual([0x01, 0x02])
+    expect(bytes[32]).toBe(2)
+  })
+
+  it('ignores a block that is cut short instead of guessing at it', () => {
+    const bytes = encodeRadioStatus({ ...base, diag })
+    expect(parseRadioStatus(bytes.subarray(0, 32)).diag).toBeUndefined()
+    expect(parseRadioStatus(bytes.subarray(0, 32)).rxOk).toBe(3)
   })
 })

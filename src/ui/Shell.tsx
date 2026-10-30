@@ -192,7 +192,7 @@ export function Shell() {
         }
         case 'agc': {
           const fe = frontEndFor(s.info, s.radioStatus)
-          say(`receiver front end, firmware ${fe.firmware}, board ${fe.board}${fe.boardAssumed ? C.dim(' (assumed)') : ''}`)
+          say(`receiver front end, firmware ${fe.firmware}, board ${fe.board} ${C.dim(`(${fe.boardBasis})`)}`)
           for (const { key, label } of FRONT_END_ROWS) say(`  ${label.padEnd(14)} ${fe[key].value} ${C.dim(`[${FRONT_END_SOURCE_LABELS[fe[key].source]}]`)}`)
           return
         }

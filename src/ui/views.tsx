@@ -8,7 +8,7 @@ import { MEDIAN_WINDOW, NOISE_SOURCE_LABELS, NUM_NOISE_FLOOR_SAMPLES } from '../
 import { NoiseChart } from './NoiseChart.tsx'
 import { configRows } from './configRows.ts'
 import { Button, Card, Empty, Rows } from './parts.tsx'
-import { radioStatusAvailable, saveSender, savedSender, store, type Message, type RadioState } from './store.ts'
+import { radioReadsZero, radioStatusAvailable, saveSender, savedSender, store, type Message, type RadioState } from './store.ts'
 import { ago, coords, db, dbm, duration, level, plural, shortKey, time } from './format.ts'
 
 /** re-render every second, for "x ago" and uptime */
@@ -434,6 +434,12 @@ function NoiseCard({ state, now }: { state: RadioState; now: number }) {
               : []),
           ]}
         />
+        {radioReadsZero(rs) && (
+          <p className="caveat">
+            RSSI is exactly 0 dBm, which is what the radio’s registers read as when it answers every SPI read with zeros.
+            The radio is likely wedged and deaf, so these readings are left out of the floor. Unplug and replug the dongle.
+          </p>
+        )}
         <NoiseChart points={state.noiseHistory} measured={state.measuredHistory} />
         {measured ? (
           <p className="note">

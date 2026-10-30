@@ -258,7 +258,7 @@ function FrontEndCard({ state }: { state: RadioState }) {
         }))}
       />
       <p className="note">
-        {state.info ? `Firmware ${fe.firmware}, board ${fe.board}${fe.boardAssumed ? ' (assumed: GET_INFO doesn’t name the board)' : ''}. ` : 'Connect to look up this firmware. '}
+        {state.info ? `Firmware ${fe.firmware}, board ${fe.board} (${fe.boardBasis}). ` : 'Connect to look up this firmware. '}
         {source}
       </p>
     </Card>

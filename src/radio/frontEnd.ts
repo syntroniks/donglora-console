@@ -18,7 +18,8 @@ export interface FrontEndValue {
 export interface FrontEnd {
   firmware: string
   board: string
-  boardAssumed: boolean // GET_INFO doesn't name the board
+  /** how the board was worked out: GET_INFO doesn't name it */
+  boardBasis: string
   rxGain: FrontEndValue
   agcReset: FrontEndValue
   femType: FrontEndValue
@@ -29,7 +30,7 @@ export interface FrontEnd {
   dcdc: FrontEndValue
 }
 
-type Row = Omit<FrontEnd, 'firmware' | 'board' | 'boardAssumed'>
+type Row = Omit<FrontEnd, 'firmware' | 'board' | 'boardBasis'>
 const fw = (value: string, note: string): FrontEndValue => ({ value, source: 'firmware-default', note })
 const awaiting = (note: string): FrontEndValue => ({ value: 'reported by RADIO_STATUS (no reply yet)', source: 'unknown', note })
 
@@ -57,21 +58,35 @@ const KNOWN: Record<string, Row> = {
     dcdc: fw('on', 'firmware/src/board/esp32s3.rs, assumed unchanged since 1.5.2'),
   },
 }
+// 1.6.1 changes how RADIO_STATUS is answered, not the V4 front end
+KNOWN['1.6.1/heltec_v4'] = KNOWN['1.6.0/heltec_v4']
 
 const unknown: FrontEndValue = { value: 'unknown', source: 'unknown', note: 'no table entry for this firmware and board' }
 
 /**
- * The board can't be read from GET_INFO; an SX1262 is assumed to be the Heltec V4 this was built for.
- * With a RADIO_STATUS reply, its values replace the table's.
+ * The board can't be read from GET_INFO. A RADIO_STATUS reply tells a Heltec V4 by its front-end module; other
+ * SX1262 boards (RAK4631, T114, ...) report none or unknown. Without RADIO_STATUS an SX1262 is assumed to be
+ * the Heltec V4 this was built for. With a RADIO_STATUS reply, its values replace the table's.
  */
+export function boardOf(info: DeviceInfo | undefined, status?: RadioStatus): { board: string; basis: string } {
+  if (status) {
+    const v4 = status.femType === FemType.Gc1109 || status.femType === FemType.Kct8103l
+    return v4
+      ? { board: 'heltec_v4', basis: 'from the front-end module RADIO_STATUS reports' }
+      : { board: 'unknown', basis: 'RADIO_STATUS reports no Heltec V4 front end, and GET_INFO doesn’t name the board' }
+  }
+  if (info?.radioChipId === 0x0002) return { board: 'heltec_v4', basis: 'assumed for an SX1262: GET_INFO doesn’t name the board' }
+  return { board: 'unknown', basis: 'GET_INFO doesn’t name the board' }
+}
+
 export function frontEndFor(info: DeviceInfo | undefined, status?: RadioStatus): FrontEnd {
   const firmware = info ? `${info.firmware.major}.${info.firmware.minor}.${info.firmware.patch}` : '?'
-  const board = info?.radioChipId === 0x0002 ? 'heltec_v4' : 'unknown'
+  const { board, basis } = boardOf(info, status)
   const row = KNOWN[`${firmware}/${board}`]
   const base: FrontEnd = {
     firmware,
     board,
-    boardAssumed: true,
+    boardBasis: basis,
     ...(row ?? { rxGain: unknown, agcReset: unknown, femType: unknown, femPower: unknown, femLna: unknown, femPa: unknown, tcxo: unknown, dcdc: unknown }),
   }
   return status ? deviceReported(base, reportedFrontEnd(status)) : base

@@ -159,6 +159,13 @@ export interface RadioState {
 }
 
 /** GET_INFO advertises RADIO_STATUS (capability bit 33) and the device hasn't refused it. */
+/**
+ * An instantaneous RSSI of exactly 0 dBm: the SX1262 never reports that while listening, but it is what every
+ * SPI read returning zeros decodes to. Seen on a RAK4631 whose SPI transfers had wedged: commands still
+ * answered OK, RX never fired.
+ */
+export const radioReadsZero = (s: RadioStatus | undefined): boolean => s?.rssiInst === 0
+
 export const radioStatusAvailable = (s: RadioState): boolean => !!s.info && hasCapability(s.info, Capability.RadioStatus) && !s.radioStatusRefused
 
 export interface StoreEvents {
@@ -584,7 +591,12 @@ export class RadioStore {
   /** Every keepalive on firmware 1.6.0: a measured noise sample (when receiving), front end and counters. */
   private onRadioStatus(status: RadioStatus): void {
     const at = Date.now()
-    if (status.rssiInst !== null) this.noise.add({ at, dbm: status.rssiInst, source: 'measured' })
+    // exactly 0 dBm is no real reading: the SX1262 answered SPI with zeros (a wedged radio, see radioReadsZero)
+    const zero = radioReadsZero(status)
+    if (zero && !radioReadsZero(this.state.radioStatus)) {
+      this.log('RADIO_STATUS RSSI is exactly 0 dBm: the radio is answering reads with zeros and is likely deaf. Unplug and replug the dongle.', 'warn')
+    }
+    if (status.rssiInst !== null && !zero) this.noise.add({ at, dbm: status.rssiInst, source: 'measured' })
     // taken on every reply, so the source falls back to packet estimates once RSSI stops coming
     const noise = this.noise.snapshot(at)
     this.patch((s) => {
@@ -592,7 +604,7 @@ export class RadioStore {
       // a new connection, or the dongle rebooted and its counters started again
       const rebase = !b || status.rxOk < b.rxOk || status.rxCrcErr < b.rxCrcErr || status.rxHeaderErr < b.rxHeaderErr
       const next: Partial<RadioState> = { radioStatus: status, radioStatusAt: at, countersBase: rebase ? status : b, noise }
-      if (status.rssiInst !== null) {
+      if (status.rssiInst !== null && !zero) {
         const point: MeasuredPoint = { at, dbm: status.rssiInst, floor: noise.floor, median: noise.median }
         next.measuredHistory = [...s.measuredHistory, point].slice(-MEASURED_HISTORY_MAX)
       }

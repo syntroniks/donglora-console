@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import { MOCK_INFO } from '../src/protocol/transports/mock.ts'
-import { deviceReported, frontEndFor } from '../src/radio/frontEnd.ts'
+import { FemType } from '../src/protocol/codes.ts'
+import type { RadioStatus } from '../src/protocol/messages.ts'
+import { boardOf, deviceReported, frontEndFor } from '../src/radio/frontEnd.ts'
+import { radioReadsZero } from '../src/radio/store.ts'
 import { NoiseFloorTracker, packetNoiseDbm } from '../src/radio/noiseFloor.ts'
 
 describe('per-packet noise', () => {
@@ -48,5 +51,24 @@ describe('receiver front end', () => {
     expect(fe.rxGain.value).toMatch(/^power saving \(0x94/)
     expect(frontEndFor({ ...MOCK_INFO, firmware: { major: 1, minor: 6, patch: 0 } }).rxGain.source).toBe('unknown')
     expect(deviceReported(fe, { rxGain: 'boosted (0x96)' }).rxGain).toEqual({ value: 'boosted (0x96)', source: 'device-reported' })
+  })
+
+  const status = (femType: number, rssiInst: number | null = -110): RadioStatus => ({ rssiInst, rxGain: 0, femType, femFlags: 0, rxOk: 0, rxCrcErr: 0, rxHeaderErr: 0 })
+  const v161 = { ...MOCK_INFO, firmware: { major: 1, minor: 6, patch: 1 } }
+
+  it('tells a Heltec V4 by its reported front end, and other SX1262 boards (RAK4631) apart', () => {
+    expect(boardOf(MOCK_INFO).board).toBe('heltec_v4')
+    expect(boardOf(v161, status(FemType.Kct8103l)).board).toBe('heltec_v4')
+    expect(boardOf(v161, status(FemType.Unknown)).board).toBe('unknown')
+    expect(boardOf(v161, status(FemType.None)).board).toBe('unknown')
+    expect(frontEndFor(v161, status(FemType.Unknown)).tcxo.source).toBe('unknown')
+    expect(frontEndFor(v161, status(FemType.Gc1109)).tcxo.value).toBe('1.8 V')
+  })
+
+  it('takes an RSSI of exactly 0 dBm as a radio reading zeros', () => {
+    expect(radioReadsZero(status(FemType.Unknown, 0))).toBe(true)
+    expect(radioReadsZero(status(FemType.Unknown, -112.5))).toBe(false)
+    expect(radioReadsZero(status(FemType.Unknown, null))).toBe(false)
+    expect(radioReadsZero(undefined)).toBe(false)
   })
 })

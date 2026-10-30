@@ -3,6 +3,7 @@ import { RADIO_CHIP_NAMES } from '../protocol/codes.ts'
 import { describeConfig } from '../protocol/lora.ts'
 import { isWebSerialSupported } from '../protocol/transports/webserial.ts'
 import { Button, ErrorBoundary } from './parts.tsx'
+import { hasPosition, MapView } from './MapView.tsx'
 import { LinkErrors, Packets } from './PacketsView.tsx'
 import { RadioView } from './RadioView.tsx'
 import { scripts } from './scripts.ts'
@@ -12,7 +13,7 @@ import { defaultServerUrl, store } from './store.ts'
 import { useRadio } from './useRadio.ts'
 import { Messages, Nodes, Overview } from './views.tsx'
 
-type Tab = 'overview' | 'radio' | 'packets' | 'link' | 'nodes' | 'messages' | 'scripts'
+type Tab = 'overview' | 'radio' | 'packets' | 'link' | 'nodes' | 'map' | 'messages' | 'scripts'
 
 const report = (p: Promise<unknown>) => void p.catch((err: unknown) => store.setError(err))
 
@@ -40,6 +41,7 @@ export function App() {
   )
 
   const st = state.stats
+  const located = Object.values(state.nodes).filter(hasPosition).length
   const failed = st.status.partial + st.status.undecodable
   const tabs: { id: Tab; label: string; bad?: boolean }[] = [
     { id: 'overview', label: 'Overview' },
@@ -47,6 +49,7 @@ export function App() {
     { id: 'packets', label: `Packets${st.rx ? ` · ${st.rx}` : ''}${failed + st.crcFail ? ` (${failed} failed, ${st.crcFail} CRC)` : ''}` },
     { id: 'link', label: `Link errors${st.linkTotal ? ` · ${st.linkTotal}` : ''}`, bad: st.linkTotal > 0 },
     { id: 'nodes', label: `Heard nodes${Object.keys(state.nodes).length ? ` · ${Object.keys(state.nodes).length}` : ''}` },
+    { id: 'map', label: `Map${located ? ` · ${located}` : ''}` },
     { id: 'messages', label: `Messages${state.messages.length ? ` · ${state.messages.length}` : ''}` },
     { id: 'scripts', label: `Scripts${scriptsState.running.length ? ` · ${scriptsState.running.length} running` : ''}` },
   ]
@@ -111,6 +114,7 @@ export function App() {
                 {tab === 'packets' && <Packets packets={state.packets} onClear={() => store.clearPackets()} />}
                 {tab === 'link' && <LinkErrors errors={state.linkErrors} counts={st.link} total={st.linkTotal} onClear={() => store.clearLinkErrors()} />}
                 {tab === 'nodes' && <Nodes state={state} />}
+                {tab === 'map' && <MapView state={state} />}
                 {tab === 'messages' && <Messages state={state} />}
                 {tab === 'scripts' && <ScriptsView />}
               </ErrorBoundary>

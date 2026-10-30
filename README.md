@@ -1,9 +1,9 @@
 # DongLoRa Console
 
 A browser console for a [DongLoRa](https://github.com/donglora) USB LoRa dongle: device info and the config the radio
-actually applied, live RX decoded by protocol [plugins](#plugins) (MeshCore and Meshtastic), the nodes they learn about,
-the channel messages they can read, link and decode errors with their bytes, a shell, and [scripts](#scripts) of your
-own that react to traffic and drive the radio.
+actually applied, live RX decoded by protocol [plugins](#plugins) (MeshCore and Meshtastic), the nodes they learn about
+and a map of those that report a position, the channel messages they can read, link and decode errors with their
+bytes, a shell, and [scripts](#scripts) of your own that react to traffic and drive the radio.
 
 It talks DongLoRa Protocol v1.0 over WebSerial, plus the v1.1 additions when the firmware has them, so it needs Chrome or
 Edge on desktop. It was built against a Heltec V4 (ESP32-S3 + SX1262) on DongLoRa firmware 1.5.2 and 1.6.0, and defaults
@@ -13,6 +13,8 @@ It can also reach the dongle through the [console server](#console-server), whic
 scripts and a JSON API, and lets the dongle sit on another machine.
 
 ## Running it
+
+The latest `main` is published at <https://syntroniks.github.io/donglora-console/>. To run it locally:
 
 ```sh
 pnpm install

@@ -15,6 +15,7 @@ import { describeConfig, mhz, syncWordHex } from '../src/protocol/lora.ts'
 import { hasCapability, type RadioStatus } from '../src/protocol/messages.ts'
 import { intervalTicker } from '../src/protocol/ticker.ts'
 import { decodePacket, DEFAULT_PRESET, pluginById, presetById, PRESETS, type DecodeStatus } from '../src/plugins/index.ts'
+import { buildLabel, stageName } from '../src/radio/wedge.ts'
 import { MEDIAN_WINDOW, NoiseFloorTracker, NUM_NOISE_FLOOR_SAMPLES } from '../src/radio/noiseFloor.ts'
 import { findDongles, NodeSerialTransport } from './node-serial.ts'
 
@@ -166,6 +167,11 @@ async function stop(): Promise<void> {
       console.log(`  counters      since boot (+while listening): ${counters(lastStatus)}`)
       console.log(`                the probe saw ${rx - crcFail} CRC ok and ${crcFail} CRC fail RX events; header errors never reach the host`)
       console.log(`  front end     RX gain ${RX_GAIN_NAMES[lastStatus.rxGain] ?? lastStatus.rxGain}; ${femText(lastStatus)}`)
+      const d = lastStatus.diag
+      if (d) {
+        console.log(`  SPI link      build ${buildLabel(d)}; ${d.wedgeStage ? `WEDGED, at "${stageName(d.wedgeStage)}"` : 'healthy'}`)
+        console.log(`                dropped SPI transfers ${d.spiCancels}, zero-status samples ${d.spiZeroReads}, recovery steps ${d.wedgeRecoveries}`)
+      } else console.log('  SPI link      this firmware reports no diagnostics')
     }
   } else console.log('  RADIO_STATUS  not supported by this firmware (no capability bit 33)')
   console.log(`  nodes         ${nodes.size ? '' : 'none'}`)

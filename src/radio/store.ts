@@ -9,6 +9,7 @@ import { hasCapability, type DeviceInfo, type LoRaConfig, type RadioStatus, type
 import { validateConfig } from '../protocol/lora.ts'
 import { decodePacket, DEFAULT_PRESET, pluginById, pluginsFor, type DecodeStatus, type MessageSighting, type NodeSighting, type PacketDecode } from '../plugins/index.ts'
 import { NoiseFloorTracker, type NoiseFloorState } from '../radio/noiseFloor.ts'
+import { radioReadsZero, wedgeUpdate } from './wedge.ts'
 
 export type Status = 'disconnected' | 'connecting' | 'connected'
 
@@ -158,14 +159,9 @@ export interface RadioState {
   radioStatusRefused: boolean
 }
 
-/** GET_INFO advertises RADIO_STATUS (capability bit 33) and the device hasn't refused it. */
-/**
- * An instantaneous RSSI of exactly 0 dBm: the SX1262 never reports that while listening, but it is what every
- * SPI read returning zeros decodes to. Seen on a RAK4631 whose SPI transfers had wedged: commands still
- * answered OK, RX never fired.
- */
-export const radioReadsZero = (s: RadioStatus | undefined): boolean => s?.rssiInst === 0
+export { radioReadsZero, radioWedged } from './wedge.ts'
 
+/** GET_INFO advertises RADIO_STATUS (capability bit 33) and the device hasn't refused it. */
 export const radioStatusAvailable = (s: RadioState): boolean => !!s.info && hasCapability(s.info, Capability.RadioStatus) && !s.radioStatusRefused
 
 export interface StoreEvents {
@@ -270,8 +266,8 @@ const messageOf = (m: MessageSighting, p: PacketEntry, protocol: string, id: num
 })
 
 export class RadioStore {
-  private state: RadioState
-  private client: DongLoRaClient | null = null
+  protected state: RadioState
+  protected client: DongLoRaClient | null = null
   private offClient: (() => void)[] = []
   private readonly subscribers = new Set<() => void>()
   private readonly listeners = initialListeners()
@@ -319,7 +315,7 @@ export class RadioStore {
 
   // ---- connection ----
 
-  private log(text: string, level: SessionEvent['level'] = 'info'): void {
+  protected log(text: string, level: SessionEvent['level'] = 'info'): void {
     const e = { at: Date.now(), text, level }
     this.patch((s) => ({ log: [e, ...s.log].slice(0, LOG_MAX) }))
     this.emit('log', e)
@@ -380,9 +376,13 @@ export class RadioStore {
         this.client = null
         this.log(err ? `connection lost: ${err.message}` : 'disconnected', err ? 'err' : 'info')
         this.patch((s) => ({ status: 'disconnected', rxOn: false, txArmed: false, error: err ? `connection lost: ${err.message}` : s.error }))
+        if (err) this.onConnectionLost(err)
       }),
     ]
   }
+
+  /** The link dropped without anyone asking (a deliberate disconnect doesn't call this). Subclasses may reconnect. */
+  protected onConnectionLost(_err: Error): void {}
 
   private async dropClient(): Promise<void> {
     const c = this.client
@@ -593,7 +593,13 @@ export class RadioStore {
     const at = Date.now()
     // exactly 0 dBm is no real reading: the SX1262 answered SPI with zeros (a wedged radio, see radioReadsZero)
     const zero = radioReadsZero(status)
-    if (zero && !radioReadsZero(this.state.radioStatus)) {
+    const update = wedgeUpdate(this.state.radioStatus?.diag, status.diag)
+    if (update) {
+      this.log(update.message, 'warn')
+      // the firmware reset the radio chip, which comes back unconfigured: send the config (and RX) again
+      if (update.reconfigure) void this.client?.recover('the firmware reset the radio').catch((err: Error) => this.log(`could not restore the session: ${err.message}`, 'err'))
+    } else if (zero && !radioReadsZero(this.state.radioStatus)) {
+      // firmware without diagnostics can't recover it
       this.log('RADIO_STATUS RSSI is exactly 0 dBm: the radio is answering reads with zeros and is likely deaf. Unplug and replug the dongle.', 'warn')
     }
     if (status.rssiInst !== null && !zero) this.noise.add({ at, dbm: status.rssiInst, source: 'measured' })

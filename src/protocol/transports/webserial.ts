@@ -38,6 +38,11 @@ export class WebSerialTransport implements Transport {
     this.label = info.usbVendorId !== undefined ? `USB ${hex4(info.usbVendorId)}:${hex4(info.usbProductId ?? 0)}` : 'serial port'
   }
 
+  /** The browser's handle for the device; it stays valid, and usable after the device returns, while the page's permission lasts. */
+  get serialPort(): SerialPort {
+    return this.port
+  }
+
   /** Ask the user to pick a port. Call it synchronously from a click handler (user gesture). */
   static async request(): Promise<WebSerialTransport> {
     if (!isWebSerialSupported()) throw new Error('this browser has no WebSerial (use Chrome or Edge on desktop)')
@@ -123,3 +128,32 @@ export class WebSerialTransport implements Transport {
 }
 
 const hex4 = (n: number) => n.toString(16).padStart(4, '0')
+
+/**
+ * Wait for a device that went away (the firmware resetting its MCU, a replug) to come back, and resolve with its port.
+ * The browser reports it with a `connect` event, and keeps the permission the user gave, so reopening needs no click.
+ * The same SerialPort object normally returns; one with the same USB ids is taken for it otherwise.
+ * Resolves undefined after `timeoutMs`, or when `signal` aborts.
+ */
+export function waitForPortReturn(port: SerialPort, timeoutMs: number, signal?: AbortSignal): Promise<SerialPort | undefined> {
+  const serial = typeof navigator !== 'undefined' ? navigator.serial : undefined
+  if (!serial || signal?.aborted) return Promise.resolve(undefined)
+  const want = port.getInfo()
+  return new Promise((resolve) => {
+    const finish = (found?: SerialPort) => {
+      clearTimeout(timer)
+      serial.removeEventListener('connect', onConnect)
+      signal?.removeEventListener('abort', onAbort)
+      resolve(found)
+    }
+    const onConnect = (e: Event) => {
+      const back = e.target as SerialPort
+      const info = back.getInfo()
+      if (back === port || (info.usbVendorId === want.usbVendorId && info.usbProductId === want.usbProductId)) finish(back)
+    }
+    const onAbort = () => finish()
+    const timer = setTimeout(finish, timeoutMs)
+    serial.addEventListener('connect', onConnect)
+    signal?.addEventListener('abort', onAbort)
+  })
+}

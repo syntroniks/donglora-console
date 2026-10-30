@@ -354,6 +354,7 @@ export class MockDongLoRaTransport implements Transport {
       rxOk: this.rxOk,
       rxCrcErr: this.rxCrcErr,
       rxHeaderErr: this.rxHeaderErr,
+      diag: { buildId: 0, buildDirty: false, spiCancels: 0, spiZeroReads: 0, wedgeRecoveries: 0, wedgeStage: 0 },
     }
   }
 
